@@ -37,6 +37,7 @@ PS C:\AutoScript> .\scripts\New-VirtualBoxWinServer2019UnattendedVm.ps1 `
   -MemoryMB 4096 `
   -CPUs 2 `
   -DiskSizeMB 61440 `
+  -DiskVariant Fixed `
   -EDriveSizeMB 102400 `
   -TDriveSizeMB 204800 `
   -ImageIndex 2 `
@@ -68,9 +69,10 @@ Common Windows Server 2019 ImageIndex values:
 3 = Datacenter Core
 4 = Datacenter Desktop Experience
 
-By default this script creates two extra VDI disks:
-E-Data.vdi = 102400 MB, formatted as E: with label Data.
-T-Data.vdi = 204800 MB, formatted as T: with label Temp.
+By default this script creates a fixed-size OS VDI so the C: disk file does not
+grow during installation. It also creates two extra dynamic VDI disks:
+E-Data.vdi = 102400 MB, formatted as E: with label SYSTEM.
+T-Data.vdi = 204800 MB, formatted as T: with label DATA.
 Use -SkipExtraDataDisks to create only the OS disk.
 #>
 [CmdletBinding()]
@@ -104,6 +106,10 @@ param(
     [int]$DiskSizeMB = 61440,
 
     [Parameter()]
+    [ValidateSet("Standard", "Fixed")]
+    [string]$DiskVariant = "Fixed",
+
+    [Parameter()]
     [ValidateRange(1024, 4194304)]
     [int]$EDriveSizeMB = 102400,
 
@@ -113,11 +119,11 @@ param(
 
     [Parameter()]
     [ValidatePattern("^[A-Za-z0-9_-]{1,32}$")]
-    [string]$EDriveLabel = "Data",
+    [string]$EDriveLabel = "SYSTEM",
 
     [Parameter()]
     [ValidatePattern("^[A-Za-z0-9_-]{1,32}$")]
-    [string]$TDriveLabel = "Temp",
+    [string]$TDriveLabel = "DATA",
 
     [Parameter()]
     [ValidateRange(1, 99)]
@@ -136,15 +142,15 @@ param(
     [string]$AdminPassword,
 
     [Parameter()]
-    [ValidatePattern("^[A-Za-z0-9][A-Za-z0-9-]{0,14}$")]
-    [string]$GuestHostName = "WIN2019LAB",
+    [ValidatePattern("^[A-Za-z0-9][A-Za-z0-9-]{0,62}(\.[A-Za-z0-9][A-Za-z0-9-]{0,62})+$")]
+    [string]$GuestHostName = "WIN2019LAB.local",
 
     [Parameter()]
     [string]$ProductKey = "",
 
     [Parameter()]
     [ValidateSet("gui", "headless", "separate")]
-    [string]$StartType = "headless",
+    [string]$StartType = "gui",
 
     [Parameter()]
     [switch]$SkipExtraDataDisks,
@@ -186,12 +192,20 @@ function Invoke-VBoxManage {
             if (($index + 1) -lt $displayArguments.Count) {
                 $displayArguments[$index + 1] = "<redacted>"
             }
+        } elseif ($displayArguments[$index] -match "^(--password|--user-password|--admin-password|--key)=") {
+            $displayArguments[$index] = ($displayArguments[$index] -replace "=.*$", "=<redacted>")
         }
     }
 
     Write-Verbose ("VBoxManage {0}" -f ($displayArguments -join " "))
-    $output = & $FilePath @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = & $FilePath @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
 
     if ($exitCode -ne 0) {
         $message = ($output | Out-String).Trim()
@@ -214,8 +228,14 @@ function Test-VirtualBoxVmExists {
         [string]$Name
     )
 
-    & $FilePath showvminfo $Name --machinereadable *> $null
-    return ($LASTEXITCODE -eq 0)
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & $FilePath showvminfo $Name --machinereadable *> $null
+        return ($LASTEXITCODE -eq 0)
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
 }
 
 function Remove-VirtualBoxVm {
@@ -230,6 +250,48 @@ function Remove-VirtualBoxVm {
     Invoke-VBoxManage -FilePath $FilePath -Arguments @(
         "unregistervm", $Name, "--delete"
     ) | Out-Null
+}
+
+function New-ExtraDiskPostInstallCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$ExtraDisks
+    )
+
+    $driveMapEntries = foreach ($extraDisk in $ExtraDisks) {
+        "@{ Letter = '$($extraDisk.DriveLetter)'; Label = '$($extraDisk.Label)' }"
+    }
+    $reservedLetterEntries = ($ExtraDisks | ForEach-Object { "'$($_.DriveLetter)'" }) -join ", "
+
+    $guestScript = @"
+`$reservedLetters = @($reservedLetterEntries)
+`$fallbackLetters = 90..80 | ForEach-Object { ([char]`$_).ToString() }
+foreach (`$reservedLetter in `$reservedLetters) {
+    `$volume = Get-Volume -DriveLetter `$reservedLetter -ErrorAction SilentlyContinue
+    if (`$volume -and `$volume.DriveType -eq 'CD-ROM') {
+        `$usedLetters = Get-Volume | Where-Object DriveLetter | ForEach-Object { `$_.DriveLetter.ToString() }
+        `$newLetter = `$fallbackLetters | Where-Object { `$_ -notin `$usedLetters -and `$_ -notin `$reservedLetters } | Select-Object -First 1
+        if (-not `$newLetter) {
+            throw "Cannot find an available drive letter to move CD-ROM drive `$reservedLetter."
+        }
+
+        Set-CimInstance -InputObject (Get-CimInstance -ClassName Win32_Volume -Filter "DriveLetter='`${reservedLetter}:'") -Property @{ DriveLetter = "`${newLetter}:" }
+    }
+}
+`$rawDisks = Get-Disk | Where-Object { `$_.PartitionStyle -eq 'RAW' } | Sort-Object Number
+`$driveMap = @(
+    $($driveMapEntries -join ",`r`n    ")
+)
+for (`$i = 0; `$i -lt [Math]::Min(`$rawDisks.Count, `$driveMap.Count); `$i++) {
+    `$disk = `$rawDisks[`$i]
+    Initialize-Disk -Number `$disk.Number -PartitionStyle GPT
+    New-Partition -DiskNumber `$disk.Number -UseMaximumSize -DriveLetter `$driveMap[`$i].Letter |
+        Format-Volume -FileSystem NTFS -NewFileSystemLabel `$driveMap[`$i].Label -Confirm:`$false
+}
+"@
+
+    $encodedGuestScript = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($guestScript))
+    return "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedGuestScript"
 }
 
 $resolvedVBoxManage = Resolve-ExistingFile -Path $VBoxManage -Description "VBoxManage.exe"
@@ -323,7 +385,7 @@ Invoke-VBoxManage -FilePath $resolvedVBoxManage -Arguments @(
     "--filename", $diskPath,
     "--size", "$DiskSizeMB",
     "--format", "VDI",
-    "--variant", "Standard"
+    "--variant", $DiskVariant
 ) | Out-Null
 
 Invoke-VBoxManage -FilePath $resolvedVBoxManage -Arguments @(
@@ -381,36 +443,35 @@ $detectOutput = Invoke-VBoxManage -FilePath $resolvedVBoxManage -Arguments @(
 
 $postInstallCommand = $null
 if ($extraDisks.Count -gt 0) {
-    $postInstallCommandTemplate = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$rawDisks = Get-Disk | Where-Object PartitionStyle -eq ''RAW'' | Sort-Object Number; $driveMap = @(@{{ Letter = ''E''; Label = ''{0}'' }}, @{{ Letter = ''T''; Label = ''{1}'' }}); for ($i = 0; $i -lt [Math]::Min($rawDisks.Count, $driveMap.Count); $i++) {{ $disk = $rawDisks[$i]; Initialize-Disk -Number $disk.Number -PartitionStyle GPT; New-Partition -DiskNumber $disk.Number -UseMaximumSize -DriveLetter $driveMap[$i].Letter | Format-Volume -FileSystem NTFS -NewFileSystemLabel $driveMap[$i].Label -Confirm:$false }}"'
-    $postInstallCommand = $postInstallCommandTemplate -f $EDriveLabel, $TDriveLabel
+    $postInstallCommand = New-ExtraDiskPostInstallCommand -ExtraDisks $extraDisks
 }
 
 $unattendedArguments = @(
     "unattended", "install", $VMName,
-    "--iso", $resolvedIsoPath,
-    "--user", $GuestUser,
-    "--password", $GuestPassword,
-    "--admin-password", $AdminPassword,
-    "--hostname", $GuestHostName,
-    "--image-index", "$ImageIndex",
-    "--locale", "en_US",
-    "--country", "US",
-    "--time-zone", "UTC",
-    "--start-vm", $StartType
+    "--iso=$resolvedIsoPath",
+    "--user=$GuestUser",
+    "--user-password=$GuestPassword",
+    "--admin-password=$AdminPassword",
+    "--hostname=$GuestHostName",
+    "--image-index=$ImageIndex",
+    "--locale=en_US",
+    "--country=US",
+    "--time-zone=UTC",
+    "--start-vm=$StartType"
 )
 
 if ($postInstallCommand) {
-    $unattendedArguments += @("--post-install-command", $postInstallCommand)
+    $unattendedArguments += @("--post-install-command=$postInstallCommand")
 }
 
 if ($ProductKey) {
-    $unattendedArguments += @("--key", $ProductKey)
+    $unattendedArguments += @("--key=$ProductKey")
 }
 
 $guestAdditionsIso = "C:\Program Files\Oracle\VirtualBox\VBoxGuestAdditions.iso"
 $guestAdditionsEnabled = Test-Path -LiteralPath $guestAdditionsIso -PathType Leaf
 if ($guestAdditionsEnabled) {
-    $unattendedArguments += @("--install-additions", "--additions-iso", $guestAdditionsIso)
+    $unattendedArguments += @("--install-additions", "--additions-iso=$guestAdditionsIso")
 } else {
     $unattendedArguments += @("--no-install-additions")
 }
@@ -425,6 +486,7 @@ Invoke-VBoxManage -FilePath $resolvedVBoxManage -Arguments $unattendedArguments 
     MemoryMB              = $MemoryMB
     CPUs                  = $CPUs
     DiskSizeMB            = $DiskSizeMB
+    DiskVariant           = $DiskVariant
     ExtraDisks            = $extraDisks
     ImageIndex            = $ImageIndex
     GuestUser             = $GuestUser

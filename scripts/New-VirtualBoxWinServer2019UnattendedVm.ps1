@@ -95,7 +95,7 @@ param(
 
     [Parameter()]
     [ValidateRange(2048, 1048576)]
-    [int]$MemoryMB = 4096,
+    [int]$MemoryMB = 8192,
 
     [Parameter()]
     [ValidateRange(1, 64)]
@@ -264,6 +264,14 @@ function New-ExtraDiskPostInstallCommand {
     $reservedLetterEntries = ($ExtraDisks | ForEach-Object { "'$($_.DriveLetter)'" }) -join ", "
 
     $guestScript = @"
+`$shellHardwareDetectionWasRunning = `$false
+`$shellHardwareDetection = Get-Service -Name ShellHWDetection -ErrorAction SilentlyContinue
+if (`$shellHardwareDetection -and `$shellHardwareDetection.Status -eq 'Running') {
+    `$shellHardwareDetectionWasRunning = `$true
+    Stop-Service -Name ShellHWDetection -Force -ErrorAction SilentlyContinue
+}
+
+try {
 `$reservedLetters = @($reservedLetterEntries)
 `$fallbackLetters = 90..80 | ForEach-Object { ([char]`$_).ToString() }
 foreach (`$reservedLetter in `$reservedLetters) {
@@ -287,6 +295,18 @@ for (`$i = 0; `$i -lt [Math]::Min(`$rawDisks.Count, `$driveMap.Count); `$i++) {
     Initialize-Disk -Number `$disk.Number -PartitionStyle GPT
     New-Partition -DiskNumber `$disk.Number -UseMaximumSize -DriveLetter `$driveMap[`$i].Letter |
         Format-Volume -FileSystem NTFS -NewFileSystemLabel `$driveMap[`$i].Label -Confirm:`$false
+}
+} finally {
+    if (`$shellHardwareDetectionWasRunning) {
+        Start-Service -Name ShellHWDetection -ErrorAction SilentlyContinue
+    }
+}
+
+`$guestAdditionsStarter = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "if (Get-Service -Name VBoxService -ErrorAction SilentlyContinue) { Set-Service -Name VBoxService -StartupType Automatic; Start-Service -Name VBoxService -ErrorAction SilentlyContinue }"'
+New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'StartVBoxService' -Value `$guestAdditionsStarter -PropertyType String -Force | Out-Null
+if (Get-Service -Name VBoxService -ErrorAction SilentlyContinue) {
+    Set-Service -Name VBoxService -StartupType Automatic
+    Start-Service -Name VBoxService -ErrorAction SilentlyContinue
 }
 "@
 

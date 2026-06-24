@@ -60,5 +60,5 @@ description: Use when creating, configuring, starting, stopping, or inspecting v
 - Default start type: `gui`; use `headless` when you do not need to observe the installer.
 - Leave product key blank for Windows Server Evaluation media unless the user provides a licensed key.
 - By default the unattended script creates two extra VDI disks: `E-Data.vdi` at 102400 MB and `T-Data.vdi` at 204800 MB.
-- The unattended script passes `--post-install-command` to move any CD-ROM that occupies `E:` or `T:` to a later free drive letter, then initialize RAW disks in Windows and format them as `E:` label `SYSTEM` and `T:` label `DATA`.
+- The unattended script passes `--post-install-command` to temporarily stop Shell Hardware Detection, move any CD-ROM that occupies `E:` or `T:` to a later free drive letter, initialize RAW disks in Windows, format them as `E:` label `SYSTEM` and `T:` label `DATA`, and set `VBoxService` to Automatic with an immediate and RunOnce start attempt.
 - Use `-EDriveSizeMB`, `-TDriveSizeMB`, `-EDriveLabel`, and `-TDriveLabel` to customize the data disks, or `-SkipExtraDataDisks` to create only the OS disk.

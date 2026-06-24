@@ -32,7 +32,7 @@ description: Use when creating, configuring, starting, stopping, or inspecting v
 - Do not guess ISO paths. Ask for or require the local ISO path.
 - Do not overwrite, unregister, delete, or recreate an existing VM unless the user explicitly asks for that destructive behavior.
 - Treat disk deletion, VM removal, snapshot deletion, and network reconfiguration as high-risk operations.
-- Treat `-Recreate` as destructive. Use it only when the user explicitly confirms the existing VM and disk can be deleted.
+- Treat `-Recreate` as destructive. Use it only when the user explicitly confirms the existing VM and disk can be deleted; it should remove stale VirtualBox disk media registrations before recreating VDI files.
 
 ## Validation
 

@@ -34,7 +34,7 @@ PS C:\AutoScript> .\scripts\New-VirtualBoxWinServer2019UnattendedVm.ps1 `
   -VMName "WIN2019-LAB" `
   -BaseFolder "C:\VM" `
   -IsoPath "C:\ISO\Windows_Server_2019.iso" `
-  -MemoryMB 4096 `
+  -MemoryMB 8192 `
   -CPUs 2 `
   -DiskSizeMB 61440 `
   -DiskVariant Fixed `
@@ -44,7 +44,7 @@ PS C:\AutoScript> .\scripts\New-VirtualBoxWinServer2019UnattendedVm.ps1 `
   -GuestUser "vboxadmin" `
   -GuestPassword "P@ssw0rd123!" `
   -AdminPassword "P@ssw0rd123!" `
-  -GuestHostName "WIN2019LAB" `
+  -GuestHostName "WIN2019LAB.local" `
   -StartType gui `
   -Recreate
 
@@ -252,6 +252,60 @@ function Remove-VirtualBoxVm {
     ) | Out-Null
 }
 
+function Get-VirtualBoxDiskMediumUuidByLocation {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Location
+    )
+
+    $fullLocation = [System.IO.Path]::GetFullPath($Location)
+    $currentUuid = $null
+    $hdds = Invoke-VBoxManage -FilePath $FilePath -Arguments @(
+        "list", "hdds"
+    )
+
+    foreach ($line in $hdds) {
+        if ($line -match '^UUID:\s+(.+)$') {
+            $currentUuid = $matches[1].Trim()
+            continue
+        }
+
+        if ($line -match '^Location:\s+(.+)$') {
+            $currentLocation = [System.IO.Path]::GetFullPath($matches[1].Trim())
+            if ([string]::Equals($currentLocation, $fullLocation, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $currentUuid
+            }
+        }
+    }
+
+    return $null
+}
+
+function Remove-VirtualBoxDiskMedium {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $mediumUuid = Get-VirtualBoxDiskMediumUuidByLocation -FilePath $FilePath -Location $Path
+    if ($mediumUuid) {
+        Invoke-VBoxManage -FilePath $FilePath -Arguments @(
+            "closemedium", "disk", $mediumUuid, "--delete"
+        ) | Out-Null
+        return
+    }
+
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        Remove-Item -LiteralPath $Path -Force
+    }
+}
+
 function New-ExtraDiskPostInstallCommand {
     param(
         [Parameter(Mandatory = $true)]
@@ -365,14 +419,10 @@ if ($Recreate) {
         Remove-VirtualBoxVm -FilePath $resolvedVBoxManage -Name $VMName
     }
 
-    if (Test-Path -LiteralPath $diskPath -PathType Leaf) {
-        Remove-Item -LiteralPath $diskPath -Force
-    }
+    Remove-VirtualBoxDiskMedium -FilePath $resolvedVBoxManage -Path $diskPath
 
     foreach ($extraDisk in $extraDisks) {
-        if (Test-Path -LiteralPath $extraDisk.Path -PathType Leaf) {
-            Remove-Item -LiteralPath $extraDisk.Path -Force
-        }
+        Remove-VirtualBoxDiskMedium -FilePath $resolvedVBoxManage -Path $extraDisk.Path
     }
 }
 

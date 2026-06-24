@@ -438,29 +438,3 @@ Invoke-VBoxManage -FilePath $resolvedVBoxManage -Arguments $unattendedArguments 
     DetectOutput          = ($detectOutput | Out-String).Trim()
     NextStep              = "VM '$VMName' has been created and unattended Windows Server 2019 installation has started."
 }
-
-<#
-.\scripts\New-VirtualBoxWinServer2019UnattendedVm.ps1 `
-  -IsoPath "C:\ISO\Windows_Server_2019.iso" `
-  -GuestPassword "P@ssw0rd123!" `
-  -AdminPassword "P@ssw0rd123!" `
-  -StartType gui
-
-.\scripts\New-VirtualBoxWinServer2019UnattendedVm.ps1 `
-  -VBoxManage "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe" `
-  -VMName "WIN2019-LAB" `
-  -BaseFolder "C:\VM" `
-  -IsoPath "C:\ISO\Windows_Server_2019.iso" `
-  -MemoryMB 4096 `
-  -CPUs 2 `
-  -DiskSizeMB 61440 `
-  -EDriveSizeMB 102400 `
-  -TDriveSizeMB 204800 `
-  -ImageIndex 2 `
-  -GuestUser "vboxadmin" `
-  -GuestPassword "P@ssw0rd123!" `
-  -AdminPassword "P@ssw0rd123!" `
-  -GuestHostName "WIN2019LAB" `
-  -StartType gui `
-  -Recreate
-#>

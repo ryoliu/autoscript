@@ -2,7 +2,7 @@
 param(
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$IsoPath = 'C:\ISO\SQLServer2019-x64-ENU.iso',
+    [string]$IsoPath = 'C:\install\SQLServer2019-x64-ENU.iso',
 
     [Parameter()]
     [ValidateSet('Silent', 'UI')]
@@ -58,7 +58,11 @@ param(
 
     [Parameter()]
     [ValidateRange(1, 2147483647)]
-    [int]$TempDbLogFileGrowth = 128
+    [int]$TempDbLogFileGrowth = 128,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$LogRoot = 'C:\autoscript\logs\SqlServer'
 )
 
 Set-StrictMode -Version Latest
@@ -102,6 +106,121 @@ function Assert-DriveExists {
     }
 }
 
+function Test-SqlServerInstanceInstalled {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $serviceName = if ($Name -eq 'MSSQLSERVER') { 'MSSQLSERVER' } else { "MSSQL`$$Name" }
+    $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+
+    if ($null -ne $service) {
+        return $true
+    }
+
+    $instanceRegistryPath = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL'
+
+    if (Test-Path -LiteralPath $instanceRegistryPath) {
+        $instanceNames = Get-ItemProperty -LiteralPath $instanceRegistryPath
+
+        if ($null -ne $instanceNames.PSObject.Properties[$Name]) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Write-SqlInstanceExistsHelp {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    Write-Warning "SQL Server instance '$Name' is already installed."
+    Write-Host ''
+    Write-Host 'To install a second SQL Server instance, copy one of these examples:'
+    Write-Host ''
+    Write-Host 'Simple example:'
+    Write-Host 'C:\AutoScript\scripts\Install-SqlServer.ps1 -InstanceName SQL2019DEV'
+    Write-Host ''
+    Write-Host 'Example with separate data folders:'
+    Write-Host 'C:\AutoScript\scripts\Install-SqlServer.ps1 -InstanceName SQL2019DEV -UserDbDir T:\SQLServerData_SQL2019DEV -UserDbLogDir T:\SQLServerLog_SQL2019DEV -TempDbDir T:\SQLServerTempDB_SQL2019DEV -BackupDir T:\SQLServerBackup_SQL2019DEV'
+    Write-Host ''
+}
+
+function Write-SqlIsoMissingHelp {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $isoFolder = Split-Path -Path $Path -Parent
+
+    if ([string]::IsNullOrWhiteSpace($isoFolder)) {
+        $isoFolder = 'C:\install'
+    }
+
+    Write-Warning "SQL Server ISO file was not found: $Path"
+    Write-Host ''
+
+    if (Test-Path -LiteralPath $isoFolder -PathType Container) {
+        $isoFiles = Get-ChildItem -LiteralPath $isoFolder -File -Filter '*.iso' -ErrorAction SilentlyContinue
+
+        if ($null -ne $isoFiles) {
+            Write-Host "ISO files found in ${isoFolder}:"
+
+            foreach ($isoFile in $isoFiles) {
+                Write-Host $isoFile.FullName
+            }
+
+            Write-Host ''
+            Write-Host 'Copy one of these examples and replace the path if needed:'
+            Write-Host "C:\AutoScript\scripts\Install-SqlServer.ps1 -IsoPath '$($isoFiles[0].FullName)'"
+            Write-Host "C:\AutoScript\scripts\Install-SqlServer.ps1 -IsoPath '$($isoFiles[0].FullName)' -InstanceName SQL2019DEV"
+            Write-Host ''
+            return
+        }
+    }
+    else {
+        Write-Host "ISO folder does not exist: $isoFolder"
+        Write-Host ''
+    }
+
+    Write-Host 'Put the SQL Server 2019 ISO at the default path, or run with -IsoPath.'
+    Write-Host ''
+    Write-Host 'Default expected path:'
+    Write-Host 'C:\install\SQLServer2019-x64-ENU.iso'
+    Write-Host ''
+    Write-Host 'Example:'
+    Write-Host "C:\AutoScript\scripts\Install-SqlServer.ps1 -IsoPath 'D:\ISO\SQLServer2019-x64-ENU.iso'"
+    Write-Host ''
+}
+
+function Resolve-SqlIsoPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        return (Resolve-Path -LiteralPath $Path).Path
+    }
+
+    $isoFolder = Split-Path -Path $Path -Parent
+
+    if ([string]::IsNullOrWhiteSpace($isoFolder)) {
+        $candidatePath = Join-Path -Path 'C:\install' -ChildPath $Path
+
+        if (Test-Path -LiteralPath $candidatePath -PathType Leaf) {
+            return (Resolve-Path -LiteralPath $candidatePath).Path
+        }
+    }
+
+    return $Path
+}
+
 function Get-TempDbFileCount {
     $cpu = Get-CimInstance -ClassName Win32_ComputerSystem
     $logicalProcessorCount = [int]$cpu.NumberOfLogicalProcessors
@@ -120,6 +239,7 @@ function Mount-SqlServerIso {
     )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Write-SqlIsoMissingHelp -Path $Path
         throw "ISO file does not exist: $Path"
     }
 
@@ -158,6 +278,28 @@ function New-DirectoryIfMissing {
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
         New-Item -Path $Path -ItemType Directory -Force | Out-Null
     }
+}
+
+function Start-InstallTranscript {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        New-Item -Path $Path -ItemType Directory -Force | Out-Null
+    }
+
+    $safeName = $Name -replace '[^a-zA-Z0-9_.-]', '_'
+    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $transcriptPath = Join-Path -Path $Path -ChildPath "Install-SqlServer-$safeName-$timestamp.log"
+
+    Start-Transcript -Path $transcriptPath -Force | Out-Null
+
+    return $transcriptPath
 }
 
 function Get-SqlServiceAccounts {
@@ -259,6 +401,9 @@ $result = [ordered]@{
     mountedDriveLetter = $null
     InstallMode        = $InstallMode
     InstanceName       = $InstanceName
+    AlreadyInstalled   = $false
+    IsoMissing         = $false
+    SkippedReason      = $null
     Features           = $Features
     InstallExitCode    = $null
     InstallSharedDir   = $InstallSharedDir
@@ -268,6 +413,7 @@ $result = [ordered]@{
     UserDbLogDir       = $UserDbLogDir
     TempDbDir          = $TempDbDir
     BackupDir          = $BackupDir
+    LogPath            = $null
 }
 
 if ($WhatIfPreference) {
@@ -276,45 +422,71 @@ if ($WhatIfPreference) {
     return
 }
 
-if (-not (Test-IsAdministrator)) {
-    throw 'Run this script from an elevated PowerShell session.'
-}
-
-Assert-DriveExists -DriveName 'E'
-Assert-DriveExists -DriveName 'T'
-
-$mountInfo = Mount-SqlServerIso -Path $IsoPath
-$result.mountedDriveLetter = $mountInfo.MountedDriveLetter
-
-@(
-    $InstallSharedDir
-    $InstallSharedWowDir
-    $InstanceDir
-    $UserDbDir
-    $UserDbLogDir
-    $TempDbDir
-    $BackupDir
-) | ForEach-Object {
-    New-DirectoryIfMissing -Path $_
-}
-
-$secureSaPassword = Read-Host 'Enter db sa password' -AsSecureString
-$saPassword = ConvertTo-PlainText -SecureString $secureSaPassword
-
-if ([string]::IsNullOrWhiteSpace($saPassword)) {
-    throw 'sa password is required for Mixed Mode installation.'
-}
-
-$tempDbFileCount = Get-TempDbFileCount
-$result.TempDbFileCount = $tempDbFileCount
-$sysAdminAccount = Get-CurrentWindowsAccount
-$setupArguments = New-SqlSetupArguments `
-    -Mode $InstallMode `
-    -SaPassword $saPassword `
-    -TempDbFileCount $tempDbFileCount `
-    -SysAdminAccount $sysAdminAccount
+$transcriptStarted = $false
+$saPassword = $null
 
 try {
+    $result.LogPath = Start-InstallTranscript -Path $LogRoot -Name $InstanceName
+    $transcriptStarted = $true
+    Write-Host "Install log: $($result.LogPath)"
+
+    $IsoPath = Resolve-SqlIsoPath -Path $IsoPath
+    $result.IsoPath = $IsoPath
+
+    if (Test-SqlServerInstanceInstalled -Name $InstanceName) {
+        $result.AlreadyInstalled = $true
+        $result.SkippedReason = "SQL Server instance '$InstanceName' is already installed."
+        Write-SqlInstanceExistsHelp -Name $InstanceName
+        [pscustomobject]$result
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $IsoPath -PathType Leaf)) {
+        $result.IsoMissing = $true
+        $result.SkippedReason = "SQL Server ISO file was not found: $IsoPath"
+        Write-SqlIsoMissingHelp -Path $IsoPath
+        [pscustomobject]$result
+        return
+    }
+
+    if (-not (Test-IsAdministrator)) {
+        throw 'Run this script from an elevated PowerShell session.'
+    }
+
+    Assert-DriveExists -DriveName 'E'
+    Assert-DriveExists -DriveName 'T'
+
+    $mountInfo = Mount-SqlServerIso -Path $IsoPath
+    $result.mountedDriveLetter = $mountInfo.MountedDriveLetter
+
+    @(
+        $InstallSharedDir
+        $InstallSharedWowDir
+        $InstanceDir
+        $UserDbDir
+        $UserDbLogDir
+        $TempDbDir
+        $BackupDir
+    ) | ForEach-Object {
+        New-DirectoryIfMissing -Path $_
+    }
+
+    $secureSaPassword = Read-Host 'Enter db sa password' -AsSecureString
+    $saPassword = ConvertTo-PlainText -SecureString $secureSaPassword
+
+    if ([string]::IsNullOrWhiteSpace($saPassword)) {
+        throw 'sa password is required for Mixed Mode installation.'
+    }
+
+    $tempDbFileCount = Get-TempDbFileCount
+    $result.TempDbFileCount = $tempDbFileCount
+    $sysAdminAccount = Get-CurrentWindowsAccount
+    $setupArguments = New-SqlSetupArguments `
+        -Mode $InstallMode `
+        -SaPassword $saPassword `
+        -TempDbFileCount $tempDbFileCount `
+        -SysAdminAccount $sysAdminAccount
+
     if ($PSCmdlet.ShouldProcess($mountInfo.SetupPath, "Install SQL Server instance $InstanceName")) {
         $process = Start-Process `
             -FilePath $mountInfo.SetupPath `
@@ -328,11 +500,16 @@ try {
             throw "SQL Server setup failed with exit code $($process.ExitCode)."
         }
     }
+
+    [pscustomobject]$result
 }
 finally {
     if ($null -ne $saPassword) {
         $saPassword = $null
     }
-}
 
-[pscustomobject]$result
+    if ($transcriptStarted) {
+        Stop-Transcript | Out-Null
+        Write-Host "Install log saved to: $($result.LogPath)"
+    }
+}

@@ -2,6 +2,10 @@
 param(
     [Parameter()]
     [ValidateNotNullOrEmpty()]
+    [string]$InstanceName = 'MSSQLSERVER',
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
     [string]$LogRoot = 'C:\autoscript\logs\OsRemediation'
 )
 
@@ -63,6 +67,31 @@ function Resolve-AccountSid {
         }
 
         throw "Could not resolve account SID: $Account"
+    }
+}
+
+function Get-SqlServiceAccounts {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $trimmedName = $Name.Trim()
+
+    if ($trimmedName -match '\\') {
+        $trimmedName = ($trimmedName -split '\\')[-1].Trim()
+    }
+
+    if ($trimmedName -ieq 'MSSQLSERVER') {
+        return [pscustomobject]@{
+            Engine = 'NT Service\MSSQLSERVER'
+            Agent  = 'NT Service\SQLSERVERAGENT'
+        }
+    }
+
+    return [pscustomobject]@{
+        Engine = "NT Service\MSSQL`$$trimmedName"
+        Agent  = "NT Service\SQLAgent`$$trimmedName"
     }
 }
 
@@ -196,6 +225,11 @@ try {
         throw 'Run this script from an elevated PowerShell session.'
     }
 
+    $sqlServiceAccounts = Get-SqlServiceAccounts -Name $InstanceName
+    Write-Status "SQL Server instance name: $InstanceName" Cyan
+    Write-Status "SQL Engine service account: $($sqlServiceAccounts.Engine)" Cyan
+    Write-Status "SQL Agent service account: $($sqlServiceAccounts.Agent)" Cyan
+
     if ($PSCmdlet.ShouldProcess('Windows Firewall', 'Disable Domain, Private, and Public profiles')) {
         Set-NetFirewallProfile -Profile Domain, Private, Public -Enabled False
         Write-Status '[OK] Windows Firewall profiles disabled.' Green
@@ -223,17 +257,17 @@ try {
     $rightAssignments = @(
         [pscustomobject]@{
             RightName = 'SeManageVolumePrivilege'
-            Accounts  = @('NT Service\MSSQLSERVER')
+            Accounts  = @($sqlServiceAccounts.Engine)
             Label     = 'Perform volume maintenance tasks'
         },
         [pscustomobject]@{
             RightName = 'SeLockMemoryPrivilege'
-            Accounts  = @('NT Service\MSSQLSERVER')
+            Accounts  = @($sqlServiceAccounts.Engine)
             Label     = 'Lock pages in memory'
         },
         [pscustomobject]@{
             RightName = 'SeChangeNotifyPrivilege'
-            Accounts  = @('NT Service\MSSQLSERVER', 'NT Service\SQLSERVERAGENT')
+            Accounts  = @($sqlServiceAccounts.Engine, $sqlServiceAccounts.Agent)
             Label     = 'Bypass traverse checking'
         }
     )
@@ -245,7 +279,8 @@ try {
         }
     }
 
-    Write-Status 'Run Test-OsSqlServerPrerequisites.ps1 again to verify the final state.' Cyan
+    Write-Status "Run Test-OsSqlServerPrerequisites.ps1 again to verify the final state for instance '$InstanceName'." Cyan
+    Write-Status "Example: C:\AutoScript\scripts\InstallSql\Test-OsSqlServerPrerequisites.ps1 -InstanceName '$InstanceName'" Cyan
 }
 finally {
     if ($transcriptStarted) {

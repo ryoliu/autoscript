@@ -321,6 +321,122 @@ function Get-SqlServiceAccounts {
     }
 }
 
+function Get-SafeSqlInstanceName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    return ($Name.Trim() -replace '[^a-zA-Z0-9_.-]', '_')
+}
+
+function Update-NamedInstanceDefaultPaths {
+    if ($InstanceName -ieq 'MSSQLSERVER') {
+        return
+    }
+
+    $safeInstanceName = Get-SafeSqlInstanceName -Name $InstanceName
+
+    if (-not $PSBoundParameters.ContainsKey('UserDbDir')) {
+        $script:UserDbDir = "T:\SQLServerData_$safeInstanceName"
+    }
+
+    if (-not $PSBoundParameters.ContainsKey('UserDbLogDir')) {
+        $script:UserDbLogDir = "T:\SQLServerLog_$safeInstanceName"
+    }
+
+    if (-not $PSBoundParameters.ContainsKey('TempDbDir')) {
+        $script:TempDbDir = "T:\SQLServerTempDB_$safeInstanceName"
+    }
+
+    if (-not $PSBoundParameters.ContainsKey('BackupDir')) {
+        $script:BackupDir = "T:\SQLServerBackup_$safeInstanceName"
+    }
+}
+
+function Get-SqlServerSetupLogs {
+    param(
+        [Parameter()]
+        [ValidateRange(1, 50)]
+        [int]$Newest = 10
+    )
+
+    $searchRoots = New-Object System.Collections.ArrayList
+
+    foreach ($version in @('170', '160', '150', '140', '130', '120', '110')) {
+        $paths = @(
+            (Join-Path -Path ${env:ProgramFiles} -ChildPath "Microsoft SQL Server\$version\Setup Bootstrap\Log"),
+            (Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath "Microsoft SQL Server\$version\Setup Bootstrap\Log")
+        )
+
+        foreach ($path in $paths) {
+            if (Test-Path -LiteralPath $path -PathType Container) {
+                [void]$searchRoots.Add($path)
+            }
+        }
+    }
+
+    foreach ($path in @($env:TEMP, 'C:\Windows\Temp')) {
+        if (Test-Path -LiteralPath $path -PathType Container) {
+            [void]$searchRoots.Add($path)
+        }
+    }
+
+    $patterns = @('Summary.txt', 'Detail.txt', 'Detail_ComponentUpdate.txt', '*.log', '*.txt')
+    $logFiles = foreach ($root in ($searchRoots | Select-Object -Unique)) {
+        foreach ($pattern in $patterns) {
+            Get-ChildItem -LiteralPath $root -Recurse -File -Filter $pattern -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.FullName -like '*Setup Bootstrap*' -or
+                    $_.Name -in @('Summary.txt', 'Detail.txt', 'Detail_ComponentUpdate.txt')
+                }
+        }
+    }
+
+    return @($logFiles |
+        Sort-Object FullName -Unique |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First $Newest FullName, LastWriteTime, Length)
+}
+
+function Write-SqlServerSetupFailureHelp {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$ExitCode
+    )
+
+    Write-Warning "SQL Server setup failed with exit code $ExitCode."
+
+    $logs = Get-SqlServerSetupLogs -Newest 10
+
+    if ($logs.Count -eq 0) {
+        Write-Warning 'No SQL Server setup logs were found in common locations.'
+        Write-Host 'Common locations to check manually:' -ForegroundColor Yellow
+        Write-Host '  C:\Program Files\Microsoft SQL Server\150\Setup Bootstrap\Log' -ForegroundColor Yellow
+        Write-Host '  C:\Program Files\Microsoft SQL Server\160\Setup Bootstrap\Log' -ForegroundColor Yellow
+        Write-Host '  C:\Windows\Temp' -ForegroundColor Yellow
+        Write-Host "  $env:TEMP" -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host ''
+    Write-Host 'Latest SQL Server setup logs:' -ForegroundColor Yellow
+    foreach ($log in $logs) {
+        Write-Host ("  {0}  {1}" -f $log.LastWriteTime, $log.FullName) -ForegroundColor Yellow
+    }
+
+    $summary = $logs |
+        Where-Object { $_.FullName -like '*\Summary.txt' } |
+        Select-Object -First 1
+
+    if ($null -ne $summary) {
+        Write-Host ''
+        Write-Host "Latest Summary.txt: $($summary.FullName)" -ForegroundColor Yellow
+        Write-Host 'Last 80 lines:' -ForegroundColor Yellow
+        Get-Content -LiteralPath $summary.FullName -Tail 80
+    }
+}
+
 function Quote-SetupValue {
     param(
         [Parameter(Mandatory = $true)]
@@ -396,6 +512,8 @@ function New-SqlSetupArguments {
     )
 }
 
+Update-NamedInstanceDefaultPaths
+
 $result = [ordered]@{
     IsoPath            = $IsoPath
     mountedDriveLetter = $null
@@ -456,6 +574,11 @@ try {
     Assert-DriveExists -DriveName 'E'
     Assert-DriveExists -DriveName 'T'
 
+    Write-Host "User database directory: $UserDbDir" -ForegroundColor Cyan
+    Write-Host "User database log directory: $UserDbLogDir" -ForegroundColor Cyan
+    Write-Host "TempDB directory: $TempDbDir" -ForegroundColor Cyan
+    Write-Host "Backup directory: $BackupDir" -ForegroundColor Cyan
+
     $mountInfo = Mount-SqlServerIso -Path $IsoPath
     $result.mountedDriveLetter = $mountInfo.MountedDriveLetter
 
@@ -481,6 +604,10 @@ try {
     $tempDbFileCount = Get-TempDbFileCount
     $result.TempDbFileCount = $tempDbFileCount
     $sysAdminAccount = Get-CurrentWindowsAccount
+    $serviceAccounts = Get-SqlServiceAccounts -Name $InstanceName
+    Write-Host "SQL Server service account: $($serviceAccounts.SqlServiceAccount)" -ForegroundColor Cyan
+    Write-Host "SQL Agent service account: $($serviceAccounts.AgentServiceAccount)" -ForegroundColor Cyan
+
     $setupArguments = New-SqlSetupArguments `
         -Mode $InstallMode `
         -SaPassword $saPassword `
@@ -497,7 +624,9 @@ try {
         $result.InstallExitCode = $process.ExitCode
 
         if ($process.ExitCode -ne 0) {
-            throw "SQL Server setup failed with exit code $($process.ExitCode)."
+            Write-SqlServerSetupFailureHelp -ExitCode $process.ExitCode
+            [pscustomobject]$result
+            exit 1
         }
     }
 

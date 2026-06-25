@@ -31,22 +31,52 @@ function New-ScriptCommand {
         [string[]]$Switches = @()
     )
 
-    $parts = @('&', (ConvertTo-CommandValue -Value $ScriptPath))
+    $scriptCommandParts = @(
+        '&',
+        'powershell.exe',
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        (ConvertTo-CommandValue -Value $ScriptPath)
+    )
 
     foreach ($key in ($Parameters.Keys | Sort-Object)) {
         $value = [string]$Parameters[$key]
 
         if (-not [string]::IsNullOrWhiteSpace($value)) {
-            $parts += "-$key"
-            $parts += (ConvertTo-CommandValue -Value $value)
+            $scriptCommandParts += "-$key"
+            $scriptCommandParts += (ConvertTo-CommandValue -Value $value)
         }
     }
 
     foreach ($switch in $Switches) {
-        $parts += "-$switch"
+        $scriptCommandParts += "-$switch"
     }
 
-    return ($parts -join ' ')
+    $parts = @(
+        "Write-Host 'ScriptPath: $($ScriptPath -replace "'", "''")' -ForegroundColor Cyan"
+    )
+
+    foreach ($key in ($Parameters.Keys | Sort-Object)) {
+        $value = [string]$Parameters[$key]
+
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $parts += "Write-Host 'Parameter $($key): $($value -replace "'", "''")' -ForegroundColor Cyan"
+        }
+    }
+
+    foreach ($switch in $Switches) {
+        $parts += "Write-Host 'Switch: $($switch -replace "'", "''")' -ForegroundColor Cyan"
+    }
+
+    $parts += ($scriptCommandParts -join ' ')
+    $parts += '$autoScriptExitCode = $LASTEXITCODE'
+    $parts += 'Write-Host '''''
+    $parts += 'Read-Host ''Press Enter to close'''
+    $parts += 'exit $autoScriptExitCode'
+
+    return ($parts -join '; ')
 }
 
 function Invoke-ScriptElevated {
@@ -69,7 +99,6 @@ function Invoke-ScriptElevated {
     $command = New-ScriptCommand -ScriptPath $ScriptPath -Parameters $Parameters -Switches $Switches
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
     $argumentList = @(
-        '-NoExit',
         '-NoProfile',
         '-ExecutionPolicy',
         'Bypass',
@@ -206,38 +235,58 @@ function New-GroupBox {
     return $groupBox
 }
 
+function Get-OsTargetInstanceName {
+    $instanceName = $osInstanceText.Text.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($instanceName)) {
+        $instanceName = 'MSSQLSERVER'
+    }
+
+    return $instanceName
+}
+
+function Get-SqlTargetServerInstance {
+    $serverInstance = $osInstanceText.Text.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($serverInstance)) {
+        $serverInstance = 'localhost'
+    }
+
+    return $serverInstance
+}
+
 $form = [System.Windows.Forms.Form]::new()
 $form.Text = 'AutoScript Launcher'
 $form.StartPosition = 'CenterScreen'
-$form.Size = [System.Drawing.Size]::new(760, 750)
+$form.Size = [System.Drawing.Size]::new(760, 705)
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 
-$osGroup = New-GroupBox -Text 'OS SQL Server Prerequisites' -X 12 -Y 12 -Width 720 -Height 70
-$runOsCheckButton = New-Button -Text 'Run OS Check' -X 18 -Y 25
-$osGroup.Controls.AddRange(@($runOsCheckButton))
+$osGroup = New-GroupBox -Text 'Target SQL Instance' -X 12 -Y 12 -Width 720 -Height 70
+$osInstanceText = New-TextBox -Text 'MSSQLSERVER' -X 140 -Y 25 -Width 180
+$osGroup.Controls.AddRange(@(
+    (New-Label -Text 'Instance Name' -X 18 -Y 27),
+    $osInstanceText
+))
 
-$sqlGroup = New-GroupBox -Text 'SQL Server Install' -X 12 -Y 92 -Width 720 -Height 150
+$sqlGroup = New-GroupBox -Text 'SQL Server Install' -X 12 -Y 92 -Width 720 -Height 120
 $sqlIsoText = New-TextBox -Text 'C:\install\SQLServer2019-x64-ENU.iso' -X 140 -Y 28
-$sqlInstanceText = New-TextBox -Text 'MSSQLSERVER' -X 140 -Y 58 -Width 180
 $sqlModeCombo = [System.Windows.Forms.ComboBox]::new()
-$sqlModeCombo.Location = [System.Drawing.Point]::new(140, 88)
+$sqlModeCombo.Location = [System.Drawing.Point]::new(140, 58)
 $sqlModeCombo.Size = [System.Drawing.Size]::new(120, 24)
 $sqlModeCombo.DropDownStyle = 'DropDownList'
 [void]$sqlModeCombo.Items.AddRange(@('UI', 'Silent'))
 $sqlModeCombo.SelectedItem = 'UI'
-$sqlRunButton = New-Button -Text 'Run SQL Install' -X 555 -Y 105
+$sqlRunButton = New-Button -Text 'Run SQL Install' -X 555 -Y 75
 $sqlGroup.Controls.AddRange(@(
     (New-Label -Text 'ISO Path' -X 18 -Y 30),
     $sqlIsoText,
-    (New-Label -Text 'Instance Name' -X 18 -Y 60),
-    $sqlInstanceText,
-    (New-Label -Text 'Install Mode' -X 18 -Y 90),
+    (New-Label -Text 'Install Mode' -X 18 -Y 60),
     $sqlModeCombo,
     $sqlRunButton
 ))
 
-$ssmsGroup = New-GroupBox -Text 'SSMS Install' -X 12 -Y 252 -Width 720 -Height 145
+$ssmsGroup = New-GroupBox -Text 'SSMS Install' -X 12 -Y 222 -Width 720 -Height 145
 $ssmsInstallerText = New-TextBox -Text 'C:\install\SSMS-Setup-ENU.exe' -X 140 -Y 28
 $ssmsPathText = New-TextBox -Text 'E:\Program Files\Microsoft SQL Server Management Studio' -X 140 -Y 58
 $ssmsModeCombo = [System.Windows.Forms.ComboBox]::new()
@@ -257,7 +306,7 @@ $ssmsGroup.Controls.AddRange(@(
     $ssmsRunButton
 ))
 
-$hotfixGroup = New-GroupBox -Text 'SQL Server Hotfix' -X 12 -Y 407 -Width 720 -Height 150
+$hotfixGroup = New-GroupBox -Text 'SQL Server Hotfix' -X 12 -Y 377 -Width 720 -Height 150
 $hotfixInstallerText = New-TextBox -Text 'C:\install\SQLServer2019-KB5008996-x64.exe' -X 140 -Y 28
 $hotfixInstanceText = New-TextBox -Text '' -X 140 -Y 58 -Width 180
 $hotfixModeCombo = [System.Windows.Forms.ComboBox]::new()
@@ -282,19 +331,22 @@ $hotfixGroup.Controls.AddRange(@(
     $hotfixRunButton
 ))
 
-$toolsGroup = New-GroupBox -Text 'Configuration Tools' -X 12 -Y 567 -Width 720 -Height 70
-$setOsSqlServerButton = New-Button -Text 'Set OS SQL Server' -X 18 -Y 25
-$setSqlServerInstanceButton = New-Button -Text 'Set SQL Server Ins' -X 170 -Y 25
-$toolsGroup.Controls.AddRange(@($setOsSqlServerButton, $setSqlServerInstanceButton))
+$toolsGroup = New-GroupBox -Text 'Configuration Tools' -X 12 -Y 537 -Width 720 -Height 70
+$runOsCheckButton = New-Button -Text 'Run OS Check' -X 18 -Y 25
+$setOsSqlServerButton = New-Button -Text 'Set OS SQL Server' -X 170 -Y 25
+$setSqlServerInstanceButton = New-Button -Text 'Set SQL Server Ins' -X 322 -Y 25
+$toolsGroup.Controls.AddRange(@($runOsCheckButton, $setOsSqlServerButton, $setSqlServerInstanceButton))
 
 $form.Controls.AddRange(@($osGroup, $sqlGroup, $ssmsGroup, $hotfixGroup, $toolsGroup))
 
 $sqlRunButton.Add_Click({
+    $targetInstanceName = Get-OsTargetInstanceName
+
     Invoke-ScriptElevated `
         -ScriptPath (Join-Path -Path $scriptRoot -ChildPath 'Install-SqlServer.ps1') `
         -Parameters @{
             IsoPath = $sqlIsoText.Text
-            InstanceName = $sqlInstanceText.Text
+            InstanceName = $targetInstanceName
             InstallMode = [string]$sqlModeCombo.SelectedItem
         }
 })
@@ -327,18 +379,32 @@ $hotfixRunButton.Add_Click({
 })
 
 $runOsCheckButton.Add_Click({
-    Invoke-ScriptElevated -ScriptPath (Join-Path -Path $scriptRoot -ChildPath 'Test-OsSqlServerPrerequisites.ps1')
+    $targetInstanceName = Get-OsTargetInstanceName
+
+    Invoke-ScriptElevated `
+        -ScriptPath (Join-Path -Path $scriptRoot -ChildPath 'Test-OsSqlServerPrerequisites.ps1') `
+        -Parameters @{
+            InstanceName = $targetInstanceName
+        }
 })
 
 $setOsSqlServerButton.Add_Click({
-    Invoke-ScriptElevated -ScriptPath (Join-Path -Path $scriptRoot -ChildPath 'Set-OsSqlServerPrerequisites.ps1')
+    $targetInstanceName = Get-OsTargetInstanceName
+
+    Invoke-ScriptElevated `
+        -ScriptPath (Join-Path -Path $scriptRoot -ChildPath 'Set-OsSqlServerPrerequisites.ps1') `
+        -Parameters @{
+            InstanceName = $targetInstanceName
+        }
 })
 
 $setSqlServerInstanceButton.Add_Click({
+    $targetServerInstance = Get-SqlTargetServerInstance
+
     Invoke-ScriptElevated `
         -ScriptPath (Join-Path -Path $scriptRoot -ChildPath 'Set-SqlServerInstanceConfiguration.ps1') `
         -Parameters @{
-            ServerInstance = $sqlInstanceText.Text
+            ServerInstance = $targetServerInstance
         }
 })
 

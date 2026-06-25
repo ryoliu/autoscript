@@ -2,6 +2,10 @@
 param(
     [Parameter()]
     [ValidateNotNullOrEmpty()]
+    [string]$InstanceName = 'MSSQLSERVER',
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
     [string]$LogRoot = 'C:\autoscript\logs\OsCheck'
 )
 
@@ -104,6 +108,31 @@ function Resolve-AccountSid {
         }
 
         return $null
+    }
+}
+
+function Get-SqlServiceAccounts {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $trimmedName = $Name.Trim()
+
+    if ($trimmedName -match '\\') {
+        $trimmedName = ($trimmedName -split '\\')[-1].Trim()
+    }
+
+    if ($trimmedName -ieq 'MSSQLSERVER') {
+        return [pscustomobject]@{
+            Engine = 'NT Service\MSSQLSERVER'
+            Agent  = 'NT Service\SQLSERVERAGENT'
+        }
+    }
+
+    return [pscustomobject]@{
+        Engine = "NT Service\MSSQL`$$trimmedName"
+        Agent  = "NT Service\SQLAgent`$$trimmedName"
     }
 }
 
@@ -333,21 +362,26 @@ $uacNeverNotify = ($enableLua -eq 0) -or ($consentPromptBehaviorAdmin -eq 0 -and
     })))
 
 $rights = Export-UserRightsAssignments
+$sqlServiceAccounts = Get-SqlServiceAccounts -Name $InstanceName
+Write-Host "SQL Server instance name: $InstanceName" -ForegroundColor Cyan
+Write-Host "SQL Engine service account: $($sqlServiceAccounts.Engine)" -ForegroundColor Cyan
+Write-Host "SQL Agent service account: $($sqlServiceAccounts.Agent)" -ForegroundColor Cyan
+
 $rightChecks = @(
     [pscustomobject]@{
         CheckName = 'Perform volume maintenance tasks for SQL Server service'
         RightName = 'SeManageVolumePrivilege'
-        Accounts = @('NT Service\MSSQLSERVER')
+        Accounts = @($sqlServiceAccounts.Engine)
     },
     [pscustomobject]@{
         CheckName = 'Lock pages in memory for SQL Server service'
         RightName = 'SeLockMemoryPrivilege'
-        Accounts = @('NT Service\MSSQLSERVER')
+        Accounts = @($sqlServiceAccounts.Engine)
     },
     [pscustomobject]@{
         CheckName = 'Bypass traverse checking for SQL Server services'
         RightName = 'SeChangeNotifyPrivilege'
-        Accounts = @('NT Service\MSSQLSERVER', 'NT Service\SQLSERVERAGENT')
+        Accounts = @($sqlServiceAccounts.Engine, $sqlServiceAccounts.Agent)
     }
 )
 

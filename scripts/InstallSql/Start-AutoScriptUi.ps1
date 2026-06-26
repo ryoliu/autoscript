@@ -9,6 +9,7 @@ Add-Type -AssemblyName System.Drawing
 
 $scriptRoot = $PSScriptRoot
 $rootPath = Split-Path -Path $scriptRoot -Parent
+$psModuleRoot = Join-Path -Path $scriptRoot -ChildPath 'psmodules'
 
 function ConvertTo-CommandValue {
     param(
@@ -210,6 +211,21 @@ function New-Button {
     return $button
 }
 
+function New-StepButton {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Text,
+
+        [Parameter(Mandatory = $true)]
+        [int]$X,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Y
+    )
+
+    return New-Button -Text $Text -X $X -Y $Y -Width 165
+}
+
 function New-GroupBox {
     param(
         [Parameter(Mandatory = $true)]
@@ -258,7 +274,7 @@ function Get-SqlTargetServerInstance {
 $form = [System.Windows.Forms.Form]::new()
 $form.Text = 'AutoScript Launcher'
 $form.StartPosition = 'CenterScreen'
-$form.Size = [System.Drawing.Size]::new(760, 705)
+$form.Size = [System.Drawing.Size]::new(760, 750)
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 
@@ -277,13 +293,11 @@ $sqlModeCombo.Size = [System.Drawing.Size]::new(120, 24)
 $sqlModeCombo.DropDownStyle = 'DropDownList'
 [void]$sqlModeCombo.Items.AddRange(@('UI', 'Silent'))
 $sqlModeCombo.SelectedItem = 'UI'
-$sqlRunButton = New-Button -Text 'Run SQL Install' -X 555 -Y 75
 $sqlGroup.Controls.AddRange(@(
     (New-Label -Text 'ISO Path' -X 18 -Y 30),
     $sqlIsoText,
     (New-Label -Text 'Install Mode' -X 18 -Y 60),
-    $sqlModeCombo,
-    $sqlRunButton
+    $sqlModeCombo
 ))
 
 $ssmsGroup = New-GroupBox -Text 'SSMS Install' -X 12 -Y 222 -Width 720 -Height 145
@@ -295,55 +309,48 @@ $ssmsModeCombo.Size = [System.Drawing.Size]::new(120, 24)
 $ssmsModeCombo.DropDownStyle = 'DropDownList'
 [void]$ssmsModeCombo.Items.AddRange(@('UI', 'Silent'))
 $ssmsModeCombo.SelectedItem = 'UI'
-$ssmsRunButton = New-Button -Text 'Run SSMS Install' -X 555 -Y 100
 $ssmsGroup.Controls.AddRange(@(
     (New-Label -Text 'Installer Path' -X 18 -Y 30),
     $ssmsInstallerText,
     (New-Label -Text 'Install Path' -X 18 -Y 60),
     $ssmsPathText,
     (New-Label -Text 'Install Mode' -X 18 -Y 90),
-    $ssmsModeCombo,
-    $ssmsRunButton
+    $ssmsModeCombo
 ))
 
-$hotfixGroup = New-GroupBox -Text 'SQL Server Hotfix' -X 12 -Y 377 -Width 720 -Height 150
+$hotfixGroup = New-GroupBox -Text 'SQL Server Hotfix' -X 12 -Y 377 -Width 720 -Height 120
 $hotfixInstallerText = New-TextBox -Text 'C:\install\SQLServer2019-KB5008996-x64.exe' -X 140 -Y 28
-$hotfixInstanceText = New-TextBox -Text '' -X 140 -Y 58 -Width 180
 $hotfixModeCombo = [System.Windows.Forms.ComboBox]::new()
-$hotfixModeCombo.Location = [System.Drawing.Point]::new(140, 88)
+$hotfixModeCombo.Location = [System.Drawing.Point]::new(140, 58)
 $hotfixModeCombo.Size = [System.Drawing.Size]::new(120, 24)
 $hotfixModeCombo.DropDownStyle = 'DropDownList'
 [void]$hotfixModeCombo.Items.AddRange(@('UI', 'Silent'))
 $hotfixModeCombo.SelectedItem = 'UI'
-$hotfixSkipRebootCheck = [System.Windows.Forms.CheckBox]::new()
-$hotfixSkipRebootCheck.Text = 'Skip pending reboot check'
-$hotfixSkipRebootCheck.Location = [System.Drawing.Point]::new(285, 90)
-$hotfixSkipRebootCheck.Size = [System.Drawing.Size]::new(200, 22)
-$hotfixRunButton = New-Button -Text 'Run Hotfix' -X 555 -Y 105
 $hotfixGroup.Controls.AddRange(@(
     (New-Label -Text 'Installer Path' -X 18 -Y 30),
     $hotfixInstallerText,
-    (New-Label -Text 'Instance Name' -X 18 -Y 60),
-    $hotfixInstanceText,
-    (New-Label -Text 'Install Mode' -X 18 -Y 90),
-    $hotfixModeCombo,
-    $hotfixSkipRebootCheck,
-    $hotfixRunButton
+    (New-Label -Text 'Install Mode' -X 18 -Y 60),
+    $hotfixModeCombo
 ))
 
-$toolsGroup = New-GroupBox -Text 'Configuration Tools' -X 12 -Y 537 -Width 720 -Height 70
-$runOsCheckButton = New-Button -Text 'Run OS Check' -X 18 -Y 25
-$setOsSqlServerButton = New-Button -Text 'Set OS SQL Server' -X 170 -Y 25
-$setSqlServerInstanceButton = New-Button -Text 'Set SQL Server Ins' -X 322 -Y 25
-$toolsGroup.Controls.AddRange(@($runOsCheckButton, $setOsSqlServerButton, $setSqlServerInstanceButton))
+$workflowGroup = New-GroupBox -Text 'Setup Workflow' -X 12 -Y 507 -Width 720 -Height 115
+$runOsCheckButton = New-StepButton -Text '1. Run OS Check' -X 18 -Y 25
+$setOsSqlServerButton = New-StepButton -Text '2. Set OS SQL Server' -X 190 -Y 25
+$sqlRunButton = New-StepButton -Text '3. Run SQL Install' -X 362 -Y 25
+$ssmsRunButton = New-StepButton -Text '4. Run SSMS Install' -X 534 -Y 25
+$installDbatoolsButton = New-StepButton -Text '5. Install dbatools' -X 18 -Y 65
+$hotfixRunButton = New-StepButton -Text '6. Run Hotfix' -X 190 -Y 65
+$setSqlServerInstanceButton = New-StepButton -Text '7. Set SQL Server Ins' -X 362 -Y 65
+$testSqlServerInstanceButton = New-StepButton -Text '8. Test SQL Server Ins' -X 534 -Y 65
+$workflowGroup.Controls.AddRange(@($runOsCheckButton, $setOsSqlServerButton, $sqlRunButton, $ssmsRunButton, $installDbatoolsButton, $hotfixRunButton, $setSqlServerInstanceButton, $testSqlServerInstanceButton))
 
-$form.Controls.AddRange(@($osGroup, $sqlGroup, $ssmsGroup, $hotfixGroup, $toolsGroup))
+$form.Controls.AddRange(@($osGroup, $sqlGroup, $ssmsGroup, $hotfixGroup, $workflowGroup))
 
 $sqlRunButton.Add_Click({
     $targetInstanceName = Get-OsTargetInstanceName
 
     Invoke-ScriptElevated `
-        -ScriptPath (Join-Path -Path $scriptRoot -ChildPath 'Install-SqlServer.ps1') `
+        -ScriptPath (Join-Path -Path $psModuleRoot -ChildPath 'Install-SqlServer.ps1') `
         -Parameters @{
             IsoPath = $sqlIsoText.Text
             InstanceName = $targetInstanceName
@@ -353,7 +360,7 @@ $sqlRunButton.Add_Click({
 
 $ssmsRunButton.Add_Click({
     Invoke-ScriptElevated `
-        -ScriptPath (Join-Path -Path $scriptRoot -ChildPath 'Install-Ssms.ps1') `
+        -ScriptPath (Join-Path -Path $psModuleRoot -ChildPath 'Install-Ssms.ps1') `
         -Parameters @{
             InstallerPath = $ssmsInstallerText.Text
             InstallPath = $ssmsPathText.Text
@@ -362,27 +369,22 @@ $ssmsRunButton.Add_Click({
 })
 
 $hotfixRunButton.Add_Click({
-    $switches = @()
-
-    if ($hotfixSkipRebootCheck.Checked) {
-        $switches += 'SkipPendingRebootCheck'
-    }
+    $targetInstanceName = Get-OsTargetInstanceName
 
     Invoke-ScriptElevated `
-        -ScriptPath (Join-Path -Path $scriptRoot -ChildPath 'Install-SqlServerHotfix.ps1') `
+        -ScriptPath (Join-Path -Path $psModuleRoot -ChildPath 'Install-SqlServerHotfix.ps1') `
         -Parameters @{
             InstallerPath = $hotfixInstallerText.Text
-            InstanceName = $hotfixInstanceText.Text
+            InstanceName = $targetInstanceName
             InstallMode = [string]$hotfixModeCombo.SelectedItem
-        } `
-        -Switches $switches
+        }
 })
 
 $runOsCheckButton.Add_Click({
     $targetInstanceName = Get-OsTargetInstanceName
 
     Invoke-ScriptElevated `
-        -ScriptPath (Join-Path -Path $scriptRoot -ChildPath 'Test-OsSqlServerPrerequisites.ps1') `
+        -ScriptPath (Join-Path -Path $psModuleRoot -ChildPath 'Test-OsSqlServerPrerequisites.ps1') `
         -Parameters @{
             InstanceName = $targetInstanceName
         }
@@ -392,7 +394,7 @@ $setOsSqlServerButton.Add_Click({
     $targetInstanceName = Get-OsTargetInstanceName
 
     Invoke-ScriptElevated `
-        -ScriptPath (Join-Path -Path $scriptRoot -ChildPath 'Set-OsSqlServerPrerequisites.ps1') `
+        -ScriptPath (Join-Path -Path $psModuleRoot -ChildPath 'Set-OsSqlServerPrerequisites.ps1') `
         -Parameters @{
             InstanceName = $targetInstanceName
         }
@@ -402,10 +404,25 @@ $setSqlServerInstanceButton.Add_Click({
     $targetServerInstance = Get-SqlTargetServerInstance
 
     Invoke-ScriptElevated `
-        -ScriptPath (Join-Path -Path $scriptRoot -ChildPath 'Set-SqlServerInstanceConfiguration.ps1') `
+        -ScriptPath (Join-Path -Path $psModuleRoot -ChildPath 'Set-SqlServerInstanceConfiguration.ps1') `
         -Parameters @{
             ServerInstance = $targetServerInstance
         }
+})
+
+$testSqlServerInstanceButton.Add_Click({
+    $targetServerInstance = Get-SqlTargetServerInstance
+
+    Invoke-ScriptElevated `
+        -ScriptPath (Join-Path -Path $psModuleRoot -ChildPath 'Test-SqlServerInstanceConfiguration.ps1') `
+        -Parameters @{
+            ServerInstance = $targetServerInstance
+        }
+})
+
+$installDbatoolsButton.Add_Click({
+    Invoke-ScriptElevated `
+        -ScriptPath (Join-Path -Path $psModuleRoot -ChildPath 'Install-Dbatools.ps1')
 })
 
 [void]$form.ShowDialog()

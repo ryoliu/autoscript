@@ -483,6 +483,7 @@ function New-SqlSetupArguments {
     return @(
         $quietSwitch
         '/ACTION=Install'
+        '/UpdateEnabled=False'
         (New-SetupSwitch -Name 'FEATURES' -Value $Features)
         (New-SetupSwitch -Name 'INSTANCENAME' -Value $InstanceName)
         (New-SetupSwitch -Name 'INSTANCEID' -Value $InstanceName)

@@ -1,0 +1,7 @@
+interface:
+  display_name: "VirtualBox Clone Report"
+  short_description: "Summarize VirtualBox clone VM settings."
+  default_prompt: "Use $virtualbox-clone-report to verify a VirtualBox cloned VM and produce a concise Traditional Chinese clone result report."
+
+policy:
+  allow_implicit_invocation: true

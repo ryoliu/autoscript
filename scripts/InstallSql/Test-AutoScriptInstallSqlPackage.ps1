@@ -72,8 +72,16 @@ foreach ($file in $requiredFiles) {
     Write-Check -Name "Required file $file" -Passed (Test-Path -LiteralPath $path -PathType Leaf)
 }
 
+$allowedRootScripts = @(
+    'Start-AutoScriptUi.ps1',
+    'Test-AutoScriptInstallSqlPackage.ps1',
+    'Invoke-InstallSqlRemote.ps1',
+    'Invoke-InstallSqlRemote2.ps1',
+    'Start-RemoteSqlInstallTask.ps1'
+)
+
 $unexpectedRootFiles = Get-ChildItem -LiteralPath $scriptRoot -File -Filter '*.ps1' |
-    Where-Object { $_.Name -notin @('Start-AutoScriptUi.ps1', 'Test-AutoScriptInstallSqlPackage.ps1') }
+    Where-Object { $_.Name -notin $allowedRootScripts }
 
 $unexpectedRootFileNames = @($unexpectedRootFiles | ForEach-Object { $_.Name })
 Write-Check -Name 'No executable ps1 files outside psmodules' -Passed ($unexpectedRootFileNames.Count -eq 0) -Detail ($unexpectedRootFileNames -join ', ')
@@ -81,7 +89,11 @@ Write-Check -Name 'No executable ps1 files outside psmodules' -Passed ($unexpect
 $ps1Files = @(
     Join-Path -Path $scriptRoot -ChildPath 'Start-AutoScriptUi.ps1'
     Join-Path -Path $scriptRoot -ChildPath 'Test-AutoScriptInstallSqlPackage.ps1'
-) + (Get-ChildItem -LiteralPath $psModuleRoot -File -Filter '*.ps1' | ForEach-Object { $_.FullName })
+    Join-Path -Path $scriptRoot -ChildPath 'Invoke-InstallSqlRemote.ps1'
+    Join-Path -Path $scriptRoot -ChildPath 'Start-RemoteSqlInstallTask.ps1'
+) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
+
+$ps1Files += Get-ChildItem -LiteralPath $psModuleRoot -File -Filter '*.ps1' | ForEach-Object { $_.FullName }
 
 foreach ($file in $ps1Files) {
     Test-PowerShellSyntax -Path $file

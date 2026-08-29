@@ -1,0 +1,30 @@
+# Local credentials and private keys
+.env
+.env.*
+*.key
+*.credential.xml
+*.pem
+*.pfx
+*.p12
+id_rsa
+id_ed25519
+
+# Oracle network and wallet files
+tnsnames.ora
+sqlnet.ora
+listener.ora
+cwallet.sso
+ewallet.p12
+wallet/
+network/admin/
+
+# Database exports and backups
+*.dmp
+*.dump
+*.bak
+*.backup
+*.bkp
+*.rman
+*.trn
+*.sql.gz
+*.sql.zip

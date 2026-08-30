@@ -1,52 +1,72 @@
 <#
 .SYNOPSIS
-Lists local SQL Server instances and provisions a service SQL Login on the
-selected instances.
+Provisions and validates a service SQL Login on selected local SQL Server
+instances.
 
 .DESCRIPTION
-Discovers local default and named SQL Server instances from Windows services,
-displays an interactive selection menu, and tests whether the current Windows
-account can connect and provision a SQL Login.
+Uses one shared instance selection supplied by the CLI, or discovers and selects
+local instances when run independently. The script checks whether the current
+Windows account can provision each instance and requests a fallback SQL
+administrator credential only when required.
 
-Windows authentication is used when the current account has sysadmin membership
-or CONTROL SERVER permission. If it does not, the script requests a fallback SQL
-administrator credential. The target service Login is created only when it does
-not already exist; its server and msdb permissions are then applied on every
-selected instance.
+The srv.mn Login is created when missing, its server and msdb permissions are
+applied idempotently, and the supplied service credential is then used to make a
+real SQL connection to every selected instance. Existing Login passwords are not
+changed; a mismatched stored password causes validation to fail.
+
+.PARAMETER SourceInstance
+Optional SQL Server connection targets. Supplying this parameter bypasses local
+discovery and the interactive instance menu.
 
 .PARAMETER ServiceLoginName
-Name of the SQL Login to create or update. The default value is srv.mn.
+Name of the SQL Login to provision and validate. The default is srv.mn.
 
 .PARAMETER ServiceCredential
-Optional credential containing the service Login name and password. The password
-is used only when the Login must be created. An existing Login password is not
-changed.
+Credential used to create and validate the service Login. When omitted, the
+script prompts for it once.
 
 .PARAMETER SqlAdminCredential
-Optional fallback SQL administrator credential. It is used only for instances
-that cannot be provisioned by the current Windows account. When omitted, the
-script prompts for a credential if one is required.
+Optional fallback SQL administrator credential. It is used only when the current
+Windows account cannot provision one or more selected instances.
+
+.PARAMETER ConnectionTimeoutSeconds
+SQL connection timeout. The default is 15 seconds.
+
+.PARAMETER CommandTimeoutSeconds
+SQL command timeout. The default is 30 seconds.
+
+.PARAMETER RetryCount
+Number of retries after the first failed transient operation. The default is 3.
+
+.PARAMETER RetryDelaySeconds
+Initial retry delay. The delay doubles for each retry and is capped at 30
+seconds. The default is 2 seconds.
 
 .EXAMPLE
 .\New-SqlServiceLogin.ps1
 
-Interactively selects instances, checks the current Windows account, and prompts
-for credentials and the new Login password only when required.
+Selects local instances, prompts for the srv.mn credential, provisions the
+Login, and validates that the credential can connect.
 
 .EXAMPLE
-$SqlCredential = Get-Credential -UserName "sa"
-.\New-SqlServiceLogin.ps1 -SqlAdminCredential $SqlCredential
+$Credential = Get-Credential -UserName "srv.mn"
+.\New-SqlServiceLogin.ps1 `
+    -SourceInstance "localhost","localhost\LAB2" `
+    -ServiceCredential $Credential
 
-Supplies a fallback SQL administrator credential before running the interactive
-instance selection.
+Uses the supplied instance list and credential without displaying an instance
+selection menu.
 
 .NOTES
-The provisioning account must be a sysadmin or have CONTROL SERVER permission.
-An existing service Login password is not changed. New Logins are created with
-CHECK_POLICY and CHECK_EXPIRATION disabled.
+This Agent script intentionally grants only server and msdb permissions. The
+Monitor repository database, table, user mapping, and object permissions are
+owned by a separate repository initialization script.
 #>
 [CmdletBinding()]
 param(
+    [Parameter()]
+    [string[]]$SourceInstance,
+
     [Parameter()]
     [ValidatePattern('^[A-Za-z0-9._-]+$')]
     [string]$ServiceLoginName = "srv.mn",
@@ -55,214 +75,188 @@ param(
     [PSCredential]$ServiceCredential,
 
     [Parameter()]
-    [PSCredential]$SqlAdminCredential
+    [PSCredential]$SqlAdminCredential,
+
+    [Parameter()]
+    [ValidateRange(1, 300)]
+    [int]$ConnectionTimeoutSeconds = 15,
+
+    [Parameter()]
+    [ValidateRange(1, 3600)]
+    [int]$CommandTimeoutSeconds = 30,
+
+    [Parameter()]
+    [ValidateRange(0, 20)]
+    [int]$RetryCount = 3,
+
+    [Parameter()]
+    [ValidateRange(0, 300)]
+    [int]$RetryDelaySeconds = 2,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$LogDirectory = (Join-Path $PSScriptRoot "Logs"),
+
+    [Parameter()]
+    [psobject]$LogContext
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# Keep sensitive values in SecureString-based objects whenever possible.
-$CurrentWindowsAccount =
-    [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$ReadOnlyAdminPassword = $null
-$ProvisioningCredential = $null
-$ServicePassword = $null
-$ProvisioningResults = [System.Collections.Generic.List[object]]::new()
+$CommonModulePath = Join-Path $PSScriptRoot "SqlMaintenance.Common.psm1"
 
-if ($null -ne $ServiceCredential) {
-    if ($ServiceCredential.UserName -cne $ServiceLoginName) {
-        throw (
-            "Service credential user [$($ServiceCredential.UserName)] " +
-            "does not match ServiceLoginName [$ServiceLoginName]."
-        )
-    }
-
-    $ServicePassword = $ServiceCredential.Password.Copy()
-    $ServicePassword.MakeReadOnly()
+if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
+    throw "Required module not found: $CommonModulePath"
 }
 
+Import-Module $CommonModulePath -Force
+
+if ($null -eq $LogContext) {
+    $LogContext = New-SqlMaintenanceLogContext `
+        -LogDirectory $LogDirectory `
+        -OperationName "New-SqlServiceLogin"
+}
+
+$SelectionParameters = @{}
+
+if ($PSBoundParameters.ContainsKey("SourceInstance")) {
+    $SelectionParameters.SourceInstance = $SourceInstance
+}
+
+$SelectedSqlInstances = @(
+    Select-SqlInstance @SelectionParameters
+)
+
+if ($null -eq $ServiceCredential) {
+    $ServiceCredential = Get-Credential `
+        -UserName $ServiceLoginName `
+        -Message (
+            "Enter the service SQL Login credential to provision and validate"
+        )
+}
+
+if ($null -eq $ServiceCredential) {
+    throw "A service SQL Login credential is required."
+}
+
+if ($ServiceCredential.UserName -cne $ServiceLoginName) {
+    throw (
+        "Service credential user [$($ServiceCredential.UserName)] does not " +
+        "match ServiceLoginName [$ServiceLoginName]."
+    )
+}
+
+Write-SqlMaintenanceLog `
+    -LogContext $LogContext `
+    -Level Info `
+    -Step "ProvisionLogin" `
+    -Message (
+        "Starting Login provisioning for: " +
+        ($SelectedSqlInstances.ConnectionTarget -join ", ")
+    )
+
+$ReadOnlyServicePassword = $ServiceCredential.Password.Copy()
+$ReadOnlyServicePassword.MakeReadOnly()
+$ServiceSqlCredential = [System.Data.SqlClient.SqlCredential]::new(
+    $ServiceCredential.UserName,
+    $ReadOnlyServicePassword
+)
+$ReadOnlyAdminPassword = $null
+$ProvisioningSqlCredential = $null
+$ProvisioningResults = [System.Collections.Generic.List[object]]::new()
+$CurrentWindowsAccount =
+    [Security.Principal.WindowsIdentity]::GetCurrent().Name
+
 try {
-    # Discover local default and named SQL Server instances from services.
-    $SqlServices = @(
-        Get-Service |
-            Where-Object {
-                $_.Name -eq "MSSQLSERVER" -or
-                $_.Name -like 'MSSQL$*'
-            } |
-            Sort-Object Name
-    )
-
-    if ($SqlServices.Count -eq 0) {
-        throw "No local SQL Server instances were found."
-    }
-
-    $SqlInstances = @(
-        for ($Index = 0; $Index -lt $SqlServices.Count; $Index++) {
-            $SqlService = $SqlServices[$Index]
-
-            # The default instance uses localhost; named instances use
-            # localhost\InstanceName.
-            if ($SqlService.Name -eq "MSSQLSERVER") {
-                $InstanceName = "MSSQLSERVER"
-                $ConnectionTarget = "localhost"
-            }
-            else {
-                $InstanceName = $SqlService.Name.Substring(6)
-                $ConnectionTarget = "localhost\$InstanceName"
-            }
-
-            [pscustomobject]@{
-                Index            = $Index + 1
-                InstanceName     = $InstanceName
-                ConnectionTarget = $ConnectionTarget
-                Status           = $SqlService.Status
-            }
-        }
-    )
-
-    Write-Host ""
-    Write-Host "Local SQL Server instances:"
-    $SqlInstances |
-        Format-Table Index, InstanceName, ConnectionTarget, Status -AutoSize |
-        Out-Host
-
-    if (-not ($SqlInstances | Where-Object Status -eq "Running")) {
-        throw "No running local SQL Server instances were found."
-    }
-
-    # Accept one or more menu indexes, or A to select every running instance.
-    while ($true) {
-        $Selection = (
-            Read-Host "Select instance numbers (example: 1,3; A = all running)"
-        ).Trim()
-
-        if ($Selection -match '^(?i)A$') {
-            $SelectedSqlInstances = @(
-                $SqlInstances | Where-Object Status -eq "Running"
-            )
-            break
-        }
-
-        $SelectedIndexes = @()
-        $SelectionIsValid = $true
-
-        # Allow comma-separated, space-separated, or mixed input.
-        foreach ($SelectionPart in ($Selection -split '[,\s]+')) {
-            $SelectedIndex = 0
-
-            if (
-                [string]::IsNullOrWhiteSpace($SelectionPart) -or
-                -not [int]::TryParse($SelectionPart, [ref]$SelectedIndex) -or
-                $SelectedIndex -lt 1 -or
-                $SelectedIndex -gt $SqlInstances.Count
-            ) {
-                $SelectionIsValid = $false
-                break
-            }
-
-            $SelectedIndexes += $SelectedIndex
-        }
-
-        $SelectedIndexes = @($SelectedIndexes | Select-Object -Unique)
-        $SelectedSqlInstances = @(
-            $SqlInstances |
-                Where-Object { $SelectedIndexes -contains $_.Index }
-        )
-
-        if (
-            -not $SelectionIsValid -or
-            $SelectedSqlInstances.Count -eq 0
-        ) {
-            Write-Warning "Invalid selection. Please try again."
-            continue
-        }
-
-        $StoppedSelections = @(
-            $SelectedSqlInstances | Where-Object Status -ne "Running"
-        )
-
-        if ($StoppedSelections.Count -gt 0) {
-            Write-Warning (
-                "The following instances are not running: " +
-                (($StoppedSelections.InstanceName) -join ", ")
-            )
-            continue
-        }
-
-        break
-    }
-
-    Write-Host "Selected instances: $($SelectedSqlInstances.InstanceName -join ', ')"
-
-    # Test the current Windows account before requesting a SQL credential.
-    # The conservative permission check requires sysadmin or CONTROL SERVER.
     $WindowsAuthenticationResults =
         [System.Collections.Generic.List[object]]::new()
 
     foreach ($SelectedInstance in $SelectedSqlInstances) {
-        $PreflightConnectionStringBuilder =
-            [System.Data.SqlClient.SqlConnectionStringBuilder]::new()
-        $PreflightConnectionStringBuilder["Data Source"] =
-            $SelectedInstance.ConnectionTarget
-        $PreflightConnectionStringBuilder["Initial Catalog"] = "master"
-        $PreflightConnectionStringBuilder["Integrated Security"] = $true
-        $PreflightConnectionStringBuilder["Encrypt"] = $true
-        $PreflightConnectionStringBuilder["TrustServerCertificate"] = $true
-        $PreflightConnectionStringBuilder["Application Name"] =
-            "Test SQL Login Provisioning Permission"
-
-        $PreflightConnection = [System.Data.SqlClient.SqlConnection]::new(
-            $PreflightConnectionStringBuilder.ConnectionString
-        )
-
         try {
-            $PreflightConnection.Open()
+            $PreflightResult = Invoke-SqlWithRetry `
+                -Step "WindowsPermissionPreflight" `
+                -Instance $SelectedInstance.ConnectionTarget `
+                -RetryCount $RetryCount `
+                -RetryDelaySeconds $RetryDelaySeconds `
+                -LogContext $LogContext `
+                -Operation {
+                    $Connection = New-SqlConnection `
+                        -DataSource $SelectedInstance.ConnectionTarget `
+                        -InitialCatalog "master" `
+                        -IntegratedSecurity `
+                        -ConnectionTimeoutSeconds `
+                            $ConnectionTimeoutSeconds `
+                        -ApplicationName "SQL Login Permission Preflight"
 
-            # Read the SQL login identity and server-level provisioning rights.
-            $PermissionCommand = $PreflightConnection.CreateCommand()
-            $PermissionCommand.CommandText = @"
+                    try {
+                        $Connection.Open()
+                        $Command = $Connection.CreateCommand()
+
+                        try {
+                            $Command.CommandTimeout = $CommandTimeoutSeconds
+                            $Command.CommandText = @"
 SELECT
-    SYSTEM_USER AS LoginName,
+    SYSTEM_USER AS [LoginName],
     CASE WHEN IS_SRVROLEMEMBER(N'sysadmin') = 1 THEN 1 ELSE 0 END
-        AS IsSysadmin,
+        AS [IsSysadmin],
     CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, N'CONTROL SERVER') = 1
-         THEN 1 ELSE 0 END AS HasControlServer;
+         THEN 1 ELSE 0 END AS [HasControlServer];
 "@
-            $PermissionReader = $PermissionCommand.ExecuteReader()
-            [void]$PermissionReader.Read()
+                            $Reader = $Command.ExecuteReader()
 
-            $DatabaseLogin = [string]$PermissionReader["LoginName"]
-            $IsSysadmin = [bool]$PermissionReader["IsSysadmin"]
-            $HasControlServer = [bool]$PermissionReader["HasControlServer"]
-            $CanCreateLogin = $IsSysadmin -or $HasControlServer
+                            try {
+                                [void]$Reader.Read()
+                                [pscustomobject]@{
+                                    DatabaseLogin =
+                                        [string]$Reader["LoginName"]
+                                    IsSysadmin =
+                                        [int]$Reader["IsSysadmin"] -eq 1
+                                    HasControlServer =
+                                        [int]$Reader["HasControlServer"] -eq 1
+                                }
+                            }
+                            finally {
+                                $Reader.Dispose()
+                            }
+                        }
+                        finally {
+                            $Command.Dispose()
+                        }
+                    }
+                    finally {
+                        $Connection.Dispose()
+                    }
+                }
 
-            $PermissionReader.Close()
-            $PermissionCommand.Dispose()
-
-            if ($CanCreateLogin) {
-                $PermissionDetail = "sysadmin or CONTROL SERVER"
+            $CanCreateLogin =
+                $PreflightResult.IsSysadmin -or
+                $PreflightResult.HasControlServer
+            $Detail = if ($CanCreateLogin) {
+                "sysadmin or CONTROL SERVER"
             }
             else {
-                $PermissionDetail =
-                    "Connected, but lacks sysadmin or CONTROL SERVER"
+                "Connected, but lacks sysadmin or CONTROL SERVER"
             }
 
             $WindowsAuthenticationResults.Add(
                 [pscustomobject]@{
-                    ConnectionTarget = $SelectedInstance.ConnectionTarget
+                    ConnectionTarget =
+                        $SelectedInstance.ConnectionTarget
                     Instance         = $SelectedInstance.InstanceName
                     WindowsAccount   = $CurrentWindowsAccount
-                    DatabaseLogin    = $DatabaseLogin
+                    DatabaseLogin    = $PreflightResult.DatabaseLogin
                     CanConnect       = $true
                     CanCreateLogin   = $CanCreateLogin
-                    Detail           = $PermissionDetail
+                    Detail           = $Detail
                 }
             )
         }
         catch {
             $WindowsAuthenticationResults.Add(
                 [pscustomobject]@{
-                    ConnectionTarget = $SelectedInstance.ConnectionTarget
+                    ConnectionTarget =
+                        $SelectedInstance.ConnectionTarget
                     Instance         = $SelectedInstance.InstanceName
                     WindowsAccount   = $CurrentWindowsAccount
                     DatabaseLogin    = $null
@@ -271,9 +265,6 @@ SELECT
                     Detail           = $_.Exception.Message
                 }
             )
-        }
-        finally {
-            $PreflightConnection.Dispose()
         }
     }
 
@@ -296,19 +287,17 @@ SELECT
     )
 
     if ($InstancesNeedingSqlCredential.Count -gt 0) {
-        # Request the fallback credential only when Windows authentication is
-        # insufficient for at least one selected instance.
         if ($null -eq $SqlAdminCredential) {
             Write-Warning (
                 "Windows authentication cannot provision every selected " +
-                "instance. A fallback SQL credential is required."
+                "instance. A fallback SQL administrator credential is " +
+                "required."
             )
-
             $SqlAdminCredential = Get-Credential `
                 -UserName "zabbix" `
                 -Message (
-                    "Enter a SQL Login that can create logins and " +
-                    "grant permissions"
+                    "Enter a SQL Login that can create logins and grant " +
+                    "permissions"
                 )
         }
 
@@ -318,10 +307,7 @@ SELECT
 
         $ReadOnlyAdminPassword = $SqlAdminCredential.Password.Copy()
         $ReadOnlyAdminPassword.MakeReadOnly()
-
-        # SqlCredential avoids placing the administrator password in the
-        # connection string.
-        $ProvisioningCredential =
+        $ProvisioningSqlCredential =
             [System.Data.SqlClient.SqlCredential]::new(
                 $SqlAdminCredential.UserName,
                 $ReadOnlyAdminPassword
@@ -329,17 +315,6 @@ SELECT
     }
 
     foreach ($SelectedInstance in $SelectedSqlInstances) {
-        # Build a separate connection for each selected SQL Server instance.
-        $ConnectionStringBuilder =
-            [System.Data.SqlClient.SqlConnectionStringBuilder]::new()
-        $ConnectionStringBuilder["Data Source"] =
-            $SelectedInstance.ConnectionTarget
-        $ConnectionStringBuilder["Initial Catalog"] = "master"
-        $ConnectionStringBuilder["Encrypt"] = $true
-        $ConnectionStringBuilder["TrustServerCertificate"] = $true
-        $ConnectionStringBuilder["Application Name"] =
-            "Create SQL Service Login"
-
         $WindowsAuthenticationResult =
             $WindowsAuthenticationResults |
                 Where-Object {
@@ -347,108 +322,171 @@ SELECT
                         $SelectedInstance.ConnectionTarget
                 } |
                 Select-Object -First 1
-
-        if ($WindowsAuthenticationResult.CanCreateLogin) {
-            # Prefer the already validated Windows account.
-            $ConnectionStringBuilder["Integrated Security"] = $true
-            $AuthenticationMode = "Windows"
-            $SqlConnection = [System.Data.SqlClient.SqlConnection]::new(
-                $ConnectionStringBuilder.ConnectionString
-            )
+        $AuthenticationMode = if (
+            $WindowsAuthenticationResult.CanCreateLogin
+        ) {
+            "Windows"
         }
         else {
-            # Use the fallback SQL credential only for instances where the
-            # Windows account did not pass the provisioning preflight.
-            $AuthenticationMode = "SQL Login"
-            $SqlConnection = [System.Data.SqlClient.SqlConnection]::new(
-                $ConnectionStringBuilder.ConnectionString,
-                $ProvisioningCredential
-            )
+            "SQL Login"
         }
-
         $LoginWasCreated = $false
+        $ResolvedInstanceName = $SelectedInstance.ConnectionTarget
 
         try {
-            Write-Host "Processing: $($SelectedInstance.ConnectionTarget)"
-            $SqlConnection.Open()
+            $ProvisionResult = Invoke-SqlWithRetry `
+                -Step "EnsureServiceLogin" `
+                -Instance $SelectedInstance.ConnectionTarget `
+                -RetryCount $RetryCount `
+                -RetryDelaySeconds $RetryDelaySeconds `
+                -LogContext $LogContext `
+                -Operation {
+                    if ($AuthenticationMode -eq "Windows") {
+                        $Connection = New-SqlConnection `
+                            -DataSource `
+                                $SelectedInstance.ConnectionTarget `
+                            -InitialCatalog "master" `
+                            -IntegratedSecurity `
+                            -ConnectionTimeoutSeconds `
+                                $ConnectionTimeoutSeconds `
+                            -ApplicationName "Provision SQL Service Login"
+                    }
+                    else {
+                        $Connection = New-SqlConnection `
+                            -DataSource `
+                                $SelectedInstance.ConnectionTarget `
+                            -InitialCatalog "master" `
+                            -SqlCredential $ProvisioningSqlCredential `
+                            -ConnectionTimeoutSeconds `
+                                $ConnectionTimeoutSeconds `
+                            -ApplicationName "Provision SQL Service Login"
+                    }
 
-            $InstanceNameCommand = $SqlConnection.CreateCommand()
-            $InstanceNameCommand.CommandText =
-                "SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(128));"
-            $ResolvedInstanceName =
-                [string]$InstanceNameCommand.ExecuteScalar()
-            $InstanceNameCommand.Dispose()
+                    try {
+                        $Connection.Open()
+                        $ServerNameCommand = $Connection.CreateCommand()
 
-            # Existing Logins keep their current password. The password prompt
-            # is shown once and reused only when new Logins must be created.
-            $LoginCheckCommand = $SqlConnection.CreateCommand()
-            $LoginCheckCommand.CommandText =
-                "SELECT CASE WHEN SUSER_ID(@LoginName) IS NULL THEN 0 ELSE 1 END;"
-            [void]$LoginCheckCommand.Parameters.Add(
-                "@LoginName",
-                [System.Data.SqlDbType]::NVarChar,
-                128
-            )
-            $LoginCheckCommand.Parameters["@LoginName"].Value =
-                $ServiceLoginName
+                        try {
+                            $ServerNameCommand.CommandTimeout =
+                                $CommandTimeoutSeconds
+                            $ServerNameCommand.CommandText =
+                                "SELECT CONVERT(nvarchar(128), " +
+                                "SERVERPROPERTY(N'ServerName'));"
+                            $CurrentResolvedInstanceName =
+                                [string]$ServerNameCommand.ExecuteScalar()
+                        }
+                        finally {
+                            $ServerNameCommand.Dispose()
+                        }
 
-            $LoginExists = [bool]$LoginCheckCommand.ExecuteScalar()
-            $LoginCheckCommand.Dispose()
+                        $LoginCheckCommand = $Connection.CreateCommand()
 
-            if (-not $LoginExists) {
-                if ($null -eq $ServicePassword) {
-                    $ServicePassword = Read-Host `
-                        "Input password for SQL Login [$ServiceLoginName]" `
-                        -AsSecureString
-                }
+                        try {
+                            $LoginCheckCommand.CommandTimeout =
+                                $CommandTimeoutSeconds
+                            $LoginCheckCommand.CommandText = @"
+SELECT [type_desc], [is_disabled]
+FROM sys.server_principals
+WHERE [name] = @LoginName;
+"@
+                            [void]$LoginCheckCommand.Parameters.Add(
+                                "@LoginName",
+                                [System.Data.SqlDbType]::NVarChar,
+                                128
+                            )
+                            $LoginCheckCommand.Parameters["@LoginName"].Value =
+                                $ServiceLoginName
+                            $Reader = $LoginCheckCommand.ExecuteReader()
 
-                $PasswordPointer = [IntPtr]::Zero
+                            try {
+                                if ($Reader.Read()) {
+                                    $LoginExists = $true
+                                    $LoginType =
+                                        [string]$Reader["type_desc"]
+                                    $LoginIsDisabled =
+                                        [bool]$Reader["is_disabled"]
+                                }
+                                else {
+                                    $LoginExists = $false
+                                    $LoginType = $null
+                                    $LoginIsDisabled = $false
+                                }
+                            }
+                            finally {
+                                $Reader.Dispose()
+                            }
+                        }
+                        finally {
+                            $LoginCheckCommand.Dispose()
+                        }
 
-                try {
-                    # SQL Server CREATE LOGIN requires a plaintext password in
-                    # the batch. Keep the conversion window as short as possible.
-                    $PasswordPointer =
-                        [Runtime.InteropServices.Marshal]::SecureStringToBSTR(
-                            $ServicePassword
-                        )
+                        if ($LoginExists -and $LoginType -ne "SQL_LOGIN") {
+                            throw (
+                                "Principal [$ServiceLoginName] exists as " +
+                                "[$LoginType], not SQL_LOGIN."
+                            )
+                        }
 
-                    $PlainServicePassword =
-                        [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
-                            $PasswordPointer
-                        )
+                        if ($LoginExists -and $LoginIsDisabled) {
+                            throw "SQL Login [$ServiceLoginName] is disabled."
+                        }
 
-                    $EscapedServicePassword =
-                        $PlainServicePassword.Replace("'", "''")
+                        $CreatedDuringAttempt = $false
 
-                    $CreateLoginCommand = $SqlConnection.CreateCommand()
-                    $CreateLoginCommand.CommandText = @"
+                        if (-not $LoginExists) {
+                            $PasswordPointer = [IntPtr]::Zero
+
+                            try {
+                                $PasswordPointer =
+                                    [Runtime.InteropServices.Marshal]::
+                                        SecureStringToBSTR(
+                                            $ServiceCredential.Password
+                                        )
+                                $PlainPassword =
+                                    [Runtime.InteropServices.Marshal]::
+                                        PtrToStringBSTR($PasswordPointer)
+                                $EscapedPassword =
+                                    $PlainPassword.Replace("'", "''")
+                                $CreateLoginCommand =
+                                    $Connection.CreateCommand()
+
+                                try {
+                                    $CreateLoginCommand.CommandTimeout =
+                                        $CommandTimeoutSeconds
+                                    $CreateLoginCommand.CommandText = @"
 CREATE LOGIN [$ServiceLoginName]
 WITH
-    PASSWORD = N'$EscapedServicePassword',
+    PASSWORD = N'$EscapedPassword',
     CHECK_POLICY = OFF,
     CHECK_EXPIRATION = OFF;
 "@
-                    [void]$CreateLoginCommand.ExecuteNonQuery()
-                    $CreateLoginCommand.Dispose()
-                    $LoginWasCreated = $true
-                }
-                finally {
-                    # Zero the unmanaged buffer immediately after execution.
-                    if ($PasswordPointer -ne [IntPtr]::Zero) {
-                        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR(
-                            $PasswordPointer
-                        )
-                    }
+                                    [void](
+                                        $CreateLoginCommand.ExecuteNonQuery()
+                                    )
+                                }
+                                finally {
+                                    $CreateLoginCommand.Dispose()
+                                }
 
-                    $PlainServicePassword = $null
-                    $EscapedServicePassword = $null
-                }
-            }
+                                $CreatedDuringAttempt = $true
+                            }
+                            finally {
+                                if ($PasswordPointer -ne [IntPtr]::Zero) {
+                                    [Runtime.InteropServices.Marshal]::
+                                        ZeroFreeBSTR($PasswordPointer)
+                                }
 
-            # Apply idempotent server permissions, create or remap the msdb
-            # user, add the Agent role membership, and grant agent_datetime.
-            $GrantCommand = $SqlConnection.CreateCommand()
-            $GrantCommand.CommandText = @"
+                                $PlainPassword = $null
+                                $EscapedPassword = $null
+                            }
+                        }
+
+                        $GrantCommand = $Connection.CreateCommand()
+
+                        try {
+                            $GrantCommand.CommandTimeout =
+                                $CommandTimeoutSeconds
+                            $GrantCommand.CommandText = @"
 GRANT CONNECT SQL TO [$ServiceLoginName];
 GRANT VIEW ANY DATABASE TO [$ServiceLoginName];
 GRANT VIEW ANY DEFINITION TO [$ServiceLoginName];
@@ -477,46 +515,133 @@ IF NOT EXISTS
       AND member_principal.name = N'$ServiceLoginName'
 )
 BEGIN
-    ALTER ROLE [SQLAgentOperatorRole] ADD MEMBER [$ServiceLoginName];
+    ALTER ROLE [SQLAgentOperatorRole]
+        ADD MEMBER [$ServiceLoginName];
 END;
 
-GRANT EXECUTE ON OBJECT::dbo.agent_datetime TO [$ServiceLoginName];
+GRANT EXECUTE ON OBJECT::dbo.agent_datetime
+    TO [$ServiceLoginName];
 "@
-            [void]$GrantCommand.ExecuteNonQuery()
-            $GrantCommand.Dispose()
+                            [void]$GrantCommand.ExecuteNonQuery()
+                        }
+                        finally {
+                            $GrantCommand.Dispose()
+                        }
+
+                        [pscustomobject]@{
+                            InstanceName = $CurrentResolvedInstanceName
+                            LoginCreated = $CreatedDuringAttempt
+                        }
+                    }
+                    finally {
+                        $Connection.Dispose()
+                    }
+                }
+
+            $LoginWasCreated = $ProvisionResult.LoginCreated
+            $ResolvedInstanceName = $ProvisionResult.InstanceName
+
+            $ValidationResult = Invoke-SqlWithRetry `
+                -Step "ValidateServiceCredential" `
+                -Instance $SelectedInstance.ConnectionTarget `
+                -RetryCount $RetryCount `
+                -RetryDelaySeconds $RetryDelaySeconds `
+                -LogContext $LogContext `
+                -Operation {
+                    $Connection = New-SqlConnection `
+                        -DataSource $SelectedInstance.ConnectionTarget `
+                        -InitialCatalog "master" `
+                        -SqlCredential $ServiceSqlCredential `
+                        -ConnectionTimeoutSeconds `
+                            $ConnectionTimeoutSeconds `
+                        -ApplicationName "Validate SQL Service Credential"
+
+                    try {
+                        $Connection.Open()
+                        $Command = $Connection.CreateCommand()
+
+                        try {
+                            $Command.CommandTimeout = $CommandTimeoutSeconds
+                            $Command.CommandText = @"
+SELECT
+    CONVERT(nvarchar(128), ORIGINAL_LOGIN()) AS [LoginName],
+    CONVERT(nvarchar(128), SERVERPROPERTY(N'ServerName'))
+        AS [ServerName];
+"@
+                            $Reader = $Command.ExecuteReader()
+
+                            try {
+                                [void]$Reader.Read()
+                                [pscustomobject]@{
+                                    LoginName =
+                                        [string]$Reader["LoginName"]
+                                    ServerName =
+                                        [string]$Reader["ServerName"]
+                                }
+                            }
+                            finally {
+                                $Reader.Dispose()
+                            }
+                        }
+                        finally {
+                            $Command.Dispose()
+                        }
+                    }
+                    finally {
+                        $Connection.Dispose()
+                    }
+                }
+
+            if ($ValidationResult.LoginName -ine $ServiceLoginName) {
+                throw (
+                    "Credential authenticated as " +
+                    "[$($ValidationResult.LoginName)], expected " +
+                    "[$ServiceLoginName]."
+                )
+            }
+
+            Write-SqlMaintenanceLog `
+                -LogContext $LogContext `
+                -Level Info `
+                -Step "ValidateServiceCredential" `
+                -Instance $SelectedInstance.ConnectionTarget `
+                -Message "Credential validation succeeded."
 
             $ProvisioningResults.Add(
                 [pscustomobject]@{
-                    Instance     = $ResolvedInstanceName
-                    Login        = $ServiceLoginName
-                    Authentication = $AuthenticationMode
-                    LoginCreated = $LoginWasCreated
-                    Permissions  = "Granted"
+                    Instance           = $ResolvedInstanceName
+                    Login              = $ServiceLoginName
+                    Authentication     = $AuthenticationMode
+                    LoginCreated       = $LoginWasCreated
+                    Permissions        = "Granted"
+                    CredentialVerified = $true
+                    Detail              = "Success"
                 }
             )
         }
         catch {
-            # Record per-instance failures so remaining instances can continue.
+            Write-SqlMaintenanceLog `
+                -LogContext $LogContext `
+                -Level Error `
+                -Step "ProvisionLogin" `
+                -Instance $SelectedInstance.ConnectionTarget `
+                -Message $_.Exception.Message
             $ProvisioningResults.Add(
                 [pscustomobject]@{
-                    Instance     = $SelectedInstance.ConnectionTarget
-                    Login        = $ServiceLoginName
-                    Authentication = $AuthenticationMode
-                    LoginCreated = $LoginWasCreated
-                    Permissions  = "Failed: $($_.Exception.Message)"
+                    Instance           = $ResolvedInstanceName
+                    Login              = $ServiceLoginName
+                    Authentication     = $AuthenticationMode
+                    LoginCreated       = $LoginWasCreated
+                    Permissions        = "Failed"
+                    CredentialVerified = $false
+                    Detail              = $_.Exception.Message
                 }
             )
-        }
-        finally {
-            $SqlConnection.Dispose()
         }
     }
 }
 finally {
-    # Dispose SecureString copies after all instances have been processed.
-    if ($null -ne $ServicePassword) {
-        $ServicePassword.Dispose()
-    }
+    $ReadOnlyServicePassword.Dispose()
 
     if ($null -ne $ReadOnlyAdminPassword) {
         $ReadOnlyAdminPassword.Dispose()
@@ -524,10 +649,28 @@ finally {
 }
 
 Write-Host ""
-Write-Host "Provisioning results:"
+Write-Host "Provisioning and credential validation results:"
 $ProvisioningResults | Format-Table -AutoSize
 
-# Return a failing process state to callers when any instance failed.
-if ($ProvisioningResults.Permissions -match '^Failed:') {
-    throw "One or more SQL Server instances failed."
+$FailedResults = @(
+    $ProvisioningResults |
+        Where-Object {
+            $_.Permissions -eq "Failed" -or
+            -not $_.CredentialVerified
+        }
+)
+
+if ($FailedResults.Count -gt 0) {
+    throw "One or more SQL Server instances failed provisioning or validation."
 }
+
+Write-SqlMaintenanceLog `
+    -LogContext $LogContext `
+    -Level Info `
+    -Step "ProvisionLogin" `
+    -Message (
+        "Provisioning and credential validation completed for " +
+        "$($ProvisioningResults.Count) instance(s)."
+    )
+
+$ProvisioningResults

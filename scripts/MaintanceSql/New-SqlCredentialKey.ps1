@@ -24,6 +24,9 @@ an interactive credential prompt.
 .PARAMETER Force
 Replaces existing key and credential files.
 
+.PARAMETER LogDirectory
+Directory for text and JSON Lines execution logs.
+
 .EXAMPLE
 .\New-SqlCredentialKey.ps1
 
@@ -53,11 +56,38 @@ param(
     [PSCredential]$Credential,
 
     [Parameter()]
-    [switch]$Force
+    [switch]$Force,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$LogDirectory = (Join-Path $PSScriptRoot "Logs"),
+
+    [Parameter()]
+    [psobject]$LogContext
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+$CommonModulePath = Join-Path $PSScriptRoot "SqlMaintenance.Common.psm1"
+
+if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
+    throw "Required module not found: $CommonModulePath"
+}
+
+Import-Module $CommonModulePath -Force
+
+if ($null -eq $LogContext) {
+    $LogContext = New-SqlMaintenanceLogContext `
+        -LogDirectory $LogDirectory `
+        -OperationName "New-SqlCredentialKey"
+}
+
+Write-SqlMaintenanceLog `
+    -LogContext $LogContext `
+    -Level Info `
+    -Step "CreateCredential" `
+    -Message "Starting encrypted credential creation for [$SqlLoginName]."
 
 function Set-RestrictedFileAcl {
     [CmdletBinding()]
@@ -185,3 +215,12 @@ $EncryptedPassword = $null
 Write-Host "SQL credential files created:"
 Write-Host "  Key:        $KeyPath"
 Write-Host "  Credential: $CredentialPath"
+
+Write-SqlMaintenanceLog `
+    -LogContext $LogContext `
+    -Level Info `
+    -Step "CreateCredential" `
+    -Message (
+        "Encrypted credential files created for [$SqlLoginName] in " +
+        "[$CredentialDirectory]."
+    )

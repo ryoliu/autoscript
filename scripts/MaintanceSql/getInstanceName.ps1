@@ -1,41 +1,36 @@
 <#
 .SYNOPSIS
-Registers a SQL Server instance name in a central monitoring table.
+Registers selected SQL Server instance names in a central monitoring table.
 
 .DESCRIPTION
-Discovers local SQL Server instances unless SourceInstance is supplied. When
-only one local instance exists, it is selected automatically. When multiple
-instances exist, the script displays an interactive menu that supports one or
-more selections.
+Uses one shared instance selection supplied by the CLI, or discovers and selects
+local instances when run independently. The script loads the encrypted srv.mn
+credential, validates the Monitor repository before any write, retrieves each
+SQL Server instance name with T-SQL, and inserts names that do not already exist.
 
-The script connects to each selected source by using the srv.mn SQL Login,
-retrieves its SQL Server instance name with T-SQL, and inserts the name into
-Monitor.dbo.InsList when it does not already exist.
-
-Unless a PSCredential is provided by the caller, the script loads an AES key and
-encrypted credential created by New-SqlCredentialKey.ps1. The password is never
-stored as plaintext in this script or in the credential file.
+SQL connections and commands use configurable timeouts. Only transient SQL or
+network failures are retried; authentication, permission, schema, and credential
+errors fail immediately.
 
 .PARAMETER SourceInstance
-Optional SQL Server instance targets from which names are retrieved. Supplying
-this parameter bypasses local discovery and the interactive selection menu.
+Optional SQL Server connection targets. Supplying this parameter bypasses local
+discovery and the interactive instance menu.
 
 .PARAMETER RepositoryInstance
-SQL Server instance that contains the monitoring repository. The default is
+SQL Server instance containing the monitoring repository. The default is
 WIN2019LAB. The parameter alias is Ins.
 
 .PARAMETER RepositoryDatabase
 Repository database name. The default is Monitor.
 
 .PARAMETER RepositorySchema
-Schema that owns the repository table. The default is dbo.
+Schema owning the repository table. The default is dbo.
 
 .PARAMETER RepositoryTable
-Table that stores SQL Server instance names. The default is InsList.
+Table storing SQL Server instance names. The default is InsList.
 
 .PARAMETER SqlLoginName
-SQL Login used for both source and repository connections. The default is
-srv.mn.
+SQL Login used for source and repository connections. The default is srv.mn.
 
 .PARAMETER CredentialDirectory
 Directory containing the AES key and encrypted credential files. The default is
@@ -47,26 +42,23 @@ Optional SQL Login credential that overrides the stored credential files.
 .EXAMPLE
 .\getInstanceName.ps1
 
-Discovers local SQL Server instances, selects the only instance automatically or
-displays a selection menu, and registers the selected instance names in
-WIN2019LAB.Monitor.dbo.InsList.
+Selects local SQL Server instances and registers them after repository
+validation.
 
 .EXAMPLE
-$Credential = Get-Credential -UserName "srv.mn"
-.\getInstanceName.ps1 -SourceInstance "localhost\LAB2" `
-    -RepositoryInstance "WIN2019LAB" -Credential $Credential
+.\getInstanceName.ps1 `
+    -SourceInstance "localhost","localhost\LAB2" `
+    -RepositoryInstance "WIN2019LAB"
 
-Registers the localhost\LAB2 instance by using the supplied credential.
+Uses the supplied instance list without displaying an instance menu.
 
 .NOTES
-The srv.mn Login requires permission to connect to the source instance. On the
-repository, it also requires a database user and SELECT/INSERT permission on
-Monitor.dbo.InsList.
+The Monitor repository database, table, user mapping, and SELECT/INSERT
+permissions must be created by the separate repository initialization script.
 #>
 [CmdletBinding()]
 param(
     [Parameter()]
-    [ValidateNotNullOrEmpty()]
     [string[]]$SourceInstance,
 
     [Parameter()]
@@ -95,191 +87,59 @@ param(
     [string]$CredentialDirectory = "E:\Scripts",
 
     [Parameter()]
-    [PSCredential]$Credential
+    [PSCredential]$Credential,
+
+    [Parameter()]
+    [ValidateRange(1, 300)]
+    [int]$ConnectionTimeoutSeconds = 15,
+
+    [Parameter()]
+    [ValidateRange(1, 3600)]
+    [int]$CommandTimeoutSeconds = 30,
+
+    [Parameter()]
+    [ValidateRange(0, 20)]
+    [int]$RetryCount = 3,
+
+    [Parameter()]
+    [ValidateRange(0, 300)]
+    [int]$RetryDelaySeconds = 2,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$LogDirectory = (Join-Path $PSScriptRoot "Logs"),
+
+    [Parameter()]
+    [psobject]$LogContext
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-function New-SqlLoginConnection {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$DataSource,
+$CommonModulePath = Join-Path $PSScriptRoot "SqlMaintenance.Common.psm1"
 
-        [Parameter(Mandatory)]
-        [string]$InitialCatalog,
-
-        [Parameter(Mandatory)]
-        [System.Data.SqlClient.SqlCredential]$SqlCredential
-    )
-
-    # Use the indexer because Windows PowerShell may reject property aliases
-    # such as DataSource on SqlConnectionStringBuilder.
-    $ConnectionStringBuilder =
-        [System.Data.SqlClient.SqlConnectionStringBuilder]::new()
-    $ConnectionStringBuilder["Data Source"] = $DataSource
-    $ConnectionStringBuilder["Initial Catalog"] = $InitialCatalog
-    $ConnectionStringBuilder["Encrypt"] = $true
-    $ConnectionStringBuilder["TrustServerCertificate"] = $true
-    $ConnectionStringBuilder["Application Name"] =
-        "Register SQL Server Instance"
-
-    return [System.Data.SqlClient.SqlConnection]::new(
-        $ConnectionStringBuilder.ConnectionString,
-        $SqlCredential
-    )
+if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
+    throw "Required module not found: $CommonModulePath"
 }
 
-# Explicit source targets bypass local service discovery.
+Import-Module $CommonModulePath -Force
+
+if ($null -eq $LogContext) {
+    $LogContext = New-SqlMaintenanceLogContext `
+        -LogDirectory $LogDirectory `
+        -OperationName "Register-SqlInstance"
+}
+
+$SelectionParameters = @{}
+
 if ($PSBoundParameters.ContainsKey("SourceInstance")) {
-    $SelectedSourceInstances = @(
-        foreach ($ConnectionTarget in $SourceInstance) {
-            [pscustomobject]@{
-                Index            = $null
-                InstanceName     = $ConnectionTarget
-                ConnectionTarget = $ConnectionTarget
-                Status           = "Specified"
-            }
-        }
-    )
+    $SelectionParameters.SourceInstance = $SourceInstance
 }
-else {
-    # Discover the default instance (MSSQLSERVER) and named instances
-    # (MSSQL$InstanceName) from local Windows services.
-    $SqlServices = @(
-        Get-Service |
-            Where-Object {
-                $_.Name -eq "MSSQLSERVER" -or
-                $_.Name -like 'MSSQL$*'
-            } |
-            Sort-Object Name
-    )
 
-    if ($SqlServices.Count -eq 0) {
-        throw "No local SQL Server instances were found."
-    }
-
-    $LocalSqlInstances = @(
-        for ($Index = 0; $Index -lt $SqlServices.Count; $Index++) {
-            $SqlService = $SqlServices[$Index]
-
-            if ($SqlService.Name -eq "MSSQLSERVER") {
-                $InstanceName = "MSSQLSERVER"
-                $ConnectionTarget = "localhost"
-            }
-            else {
-                $InstanceName = $SqlService.Name.Substring(6)
-                $ConnectionTarget = "localhost\$InstanceName"
-            }
-
-            [pscustomobject]@{
-                Index            = $Index + 1
-                InstanceName     = $InstanceName
-                ConnectionTarget = $ConnectionTarget
-                Status           = $SqlService.Status
-            }
-        }
-    )
-
-    $RunningSqlInstances = @(
-        $LocalSqlInstances | Where-Object Status -eq "Running"
-    )
-
-    if ($RunningSqlInstances.Count -eq 0) {
-        throw "No running local SQL Server instances were found."
-    }
-
-    if ($LocalSqlInstances.Count -eq 1) {
-        # Do not display a menu when only one local instance exists.
-        $SelectedSourceInstances = @($RunningSqlInstances[0])
-        Write-Host (
-            "SQL Server instance selected automatically: " +
-            $SelectedSourceInstances[0].ConnectionTarget
-        )
-    }
-    else {
-        Write-Host ""
-        Write-Host "Local SQL Server instances:"
-        $LocalSqlInstances |
-            Format-Table Index, InstanceName, ConnectionTarget, Status `
-                -AutoSize |
-            Out-Host
-
-        # Accept one or more indexes, or A for every running instance.
-        while ($true) {
-            $Selection = (
-                Read-Host (
-                    "Select instance numbers " +
-                    "(example: 1,3; A = all running)"
-                )
-            ).Trim()
-
-            if ($Selection -match '^A$') {
-                $SelectedSourceInstances = @($RunningSqlInstances)
-                break
-            }
-
-            $SelectedIndexes = @()
-            $SelectionIsValid = $true
-
-            foreach ($SelectionPart in ($Selection -split '[,\s]+')) {
-                $SelectedIndex = 0
-
-                if (
-                    [string]::IsNullOrWhiteSpace($SelectionPart) -or
-                    -not [int]::TryParse(
-                        $SelectionPart,
-                        [ref]$SelectedIndex
-                    ) -or
-                    $SelectedIndex -lt 1 -or
-                    $SelectedIndex -gt $LocalSqlInstances.Count
-                ) {
-                    $SelectionIsValid = $false
-                    break
-                }
-
-                $SelectedIndexes += $SelectedIndex
-            }
-
-            $SelectedIndexes = @(
-                $SelectedIndexes | Select-Object -Unique
-            )
-            $SelectedSourceInstances = @(
-                $LocalSqlInstances |
-                    Where-Object { $SelectedIndexes -contains $_.Index }
-            )
-
-            if (
-                -not $SelectionIsValid -or
-                $SelectedSourceInstances.Count -eq 0
-            ) {
-                Write-Warning "Invalid selection. Please try again."
-                continue
-            }
-
-            $StoppedSelections = @(
-                $SelectedSourceInstances |
-                    Where-Object Status -ne "Running"
-            )
-
-            if ($StoppedSelections.Count -gt 0) {
-                Write-Warning (
-                    "The following instances are not running: " +
-                    ($StoppedSelections.InstanceName -join ", ")
-                )
-                continue
-            }
-
-            break
-        }
-
-        Write-Host (
-            "Selected instances: " +
-            ($SelectedSourceInstances.InstanceName -join ", ")
-        )
-    }
-}
+$SelectedSourceInstances = @(
+    Select-SqlInstance @SelectionParameters
+)
+$LoadedCredentialPassword = $null
 
 if ($null -eq $Credential) {
     $KeyPath = Join-Path $CredentialDirectory "$SqlLoginName.key"
@@ -321,16 +181,15 @@ if ($null -eq $Credential) {
             throw "Invalid SQL credential file: $CredentialPath"
         }
 
-        $StoredPassword =
+        $LoadedCredentialPassword =
             $StoredCredential.EncryptedPassword |
                 ConvertTo-SecureString -Key $AesKey
         $Credential = [PSCredential]::new(
             [string]$StoredCredential.UserName,
-            $StoredPassword
+            $LoadedCredentialPassword
         )
     }
     finally {
-        # Remove the plaintext AES key bytes from the managed array after use.
         [Array]::Clear($AesKey, 0, $AesKey.Length)
     }
 }
@@ -342,77 +201,123 @@ if ($Credential.UserName -cne $SqlLoginName) {
     )
 }
 
-# SqlCredential requires a read-only SecureString. The copied value is disposed
-# after both SQL connections have finished.
+Write-SqlMaintenanceLog `
+    -LogContext $LogContext `
+    -Level Info `
+    -Step "RegisterInstances" `
+    -Message (
+        "Starting registration for: " +
+        ($SelectedSourceInstances.ConnectionTarget -join ", ")
+    )
+
+# Repository validation is intentionally performed inside this script as well
+# as the CLI so direct execution cannot bypass the prerequisite checks.
+$RepositoryPreflight = Test-SqlMonitorRepository `
+    -RepositoryInstance $RepositoryInstance `
+    -RepositoryDatabase $RepositoryDatabase `
+    -RepositorySchema $RepositorySchema `
+    -RepositoryTable $RepositoryTable `
+    -Credential $Credential `
+    -ConnectionTimeoutSeconds $ConnectionTimeoutSeconds `
+    -CommandTimeoutSeconds $CommandTimeoutSeconds `
+    -RetryCount $RetryCount `
+    -RetryDelaySeconds $RetryDelaySeconds `
+    -LogContext $LogContext
+
+$MaximumInstanceNameLength = if (
+    $RepositoryPreflight.InsNameLength -eq -1
+) {
+    128
+}
+else {
+    $RepositoryPreflight.InsNameLength
+}
+
 $ReadOnlyPassword = $Credential.Password.Copy()
 $ReadOnlyPassword.MakeReadOnly()
 $SqlCredential = [System.Data.SqlClient.SqlCredential]::new(
-    $SqlLoginName,
+    $Credential.UserName,
     $ReadOnlyPassword
 )
-
-$RepositoryConnection = $null
 $RegistrationResults = [System.Collections.Generic.List[object]]::new()
 $QualifiedTable = "[$RepositorySchema].[$RepositoryTable]"
 
 try {
-    # Open one repository connection and reuse it for all selected sources.
-    $RepositoryConnection = New-SqlLoginConnection `
-        -DataSource $RepositoryInstance `
-        -InitialCatalog $RepositoryDatabase `
-        -SqlCredential $SqlCredential
-    $RepositoryConnection.Open()
-
     foreach ($SelectedSourceInstance in $SelectedSourceInstances) {
-        $SourceConnection = $null
         $SqlInstanceName = $null
 
         try {
-            Write-Host (
-                "Processing source: " +
-                $SelectedSourceInstance.ConnectionTarget
-            )
+            $SqlInstanceName = Invoke-SqlWithRetry `
+                -Step "ReadInstanceName" `
+                -Instance $SelectedSourceInstance.ConnectionTarget `
+                -RetryCount $RetryCount `
+                -RetryDelaySeconds $RetryDelaySeconds `
+                -LogContext $LogContext `
+                -Operation {
+                    $Connection = New-SqlConnection `
+                        -DataSource `
+                            $SelectedSourceInstance.ConnectionTarget `
+                        -InitialCatalog "master" `
+                        -SqlCredential $SqlCredential `
+                        -ConnectionTimeoutSeconds `
+                            $ConnectionTimeoutSeconds `
+                        -ApplicationName "Read SQL Instance Name"
 
-            # Retrieve the configured SQL Server name, including the named
-            # instance suffix when the source is not a default instance.
-            $SourceConnection = New-SqlLoginConnection `
-                -DataSource $SelectedSourceInstance.ConnectionTarget `
-                -InitialCatalog "master" `
-                -SqlCredential $SqlCredential
-            $SourceConnection.Open()
+                    try {
+                        $Connection.Open()
+                        $Command = $Connection.CreateCommand()
 
-            $InstanceNameCommand = $SourceConnection.CreateCommand()
-
-            try {
-                $InstanceNameCommand.CommandText = @"
+                        try {
+                            $Command.CommandTimeout = $CommandTimeoutSeconds
+                            $Command.CommandText = @"
 SET NOCOUNT ON;
 SELECT CONVERT(nvarchar(128), SERVERPROPERTY(N'ServerName'));
 "@
-                $SqlInstanceName =
-                    [string]$InstanceNameCommand.ExecuteScalar()
-            }
-            finally {
-                $InstanceNameCommand.Dispose()
-            }
+                            [string]$Command.ExecuteScalar()
+                        }
+                        finally {
+                            $Command.Dispose()
+                        }
+                    }
+                    finally {
+                        $Connection.Dispose()
+                    }
+                }
 
             if ([string]::IsNullOrWhiteSpace($SqlInstanceName)) {
                 throw "SQL Server returned an empty instance name."
             }
 
-            # InsList.InsName was previously handled as a 50-character value.
-            if ($SqlInstanceName.Length -gt 50) {
+            if ($SqlInstanceName.Length -gt $MaximumInstanceNameLength) {
                 throw (
-                    "SQL instance name exceeds 50 characters: " +
-                    $SqlInstanceName
+                    "SQL instance name length $($SqlInstanceName.Length) " +
+                    "exceeds repository InsName length " +
+                    "${MaximumInstanceNameLength}: $SqlInstanceName"
                 )
             }
 
-            # The instance name is sent as a SQL parameter rather than being
-            # concatenated into the T-SQL batch.
-            $RegisterCommand = $RepositoryConnection.CreateCommand()
+            $WasInserted = Invoke-SqlWithRetry `
+                -Step "WriteRepository" `
+                -Instance $RepositoryInstance `
+                -RetryCount $RetryCount `
+                -RetryDelaySeconds $RetryDelaySeconds `
+                -LogContext $LogContext `
+                -Operation {
+                    $Connection = New-SqlConnection `
+                        -DataSource $RepositoryInstance `
+                        -InitialCatalog $RepositoryDatabase `
+                        -SqlCredential $SqlCredential `
+                        -ConnectionTimeoutSeconds `
+                            $ConnectionTimeoutSeconds `
+                        -ApplicationName "Register SQL Instance"
 
-            try {
-                $RegisterCommand.CommandText = @"
+                    try {
+                        $Connection.Open()
+                        $Command = $Connection.CreateCommand()
+
+                        try {
+                            $Command.CommandTimeout = $CommandTimeoutSeconds
+                            $Command.CommandText = @"
 SET NOCOUNT ON;
 
 DECLARE @Inserted bit = 0;
@@ -432,60 +337,72 @@ END;
 
 SELECT @Inserted;
 "@
-                [void]$RegisterCommand.Parameters.Add(
-                    "@InstanceName",
-                    [System.Data.SqlDbType]::NVarChar,
-                    50
-                )
-                $RegisterCommand.Parameters["@InstanceName"].Value =
-                    $SqlInstanceName
+                            [void]$Command.Parameters.Add(
+                                "@InstanceName",
+                                [System.Data.SqlDbType]::NVarChar,
+                                128
+                            )
+                            $Command.Parameters["@InstanceName"].Value =
+                                $SqlInstanceName
+                            [bool]$Command.ExecuteScalar()
+                        }
+                        finally {
+                            $Command.Dispose()
+                        }
+                    }
+                    finally {
+                        $Connection.Dispose()
+                    }
+                }
 
-                $WasInserted = [bool]$RegisterCommand.ExecuteScalar()
-            }
-            finally {
-                $RegisterCommand.Dispose()
-            }
-
-            if ($WasInserted) {
-                $RegistrationStatus = "Inserted"
+            $Status = if ($WasInserted) {
+                "Inserted"
             }
             else {
-                $RegistrationStatus = "Already exists"
+                "Already exists"
             }
 
+            Write-SqlMaintenanceLog `
+                -LogContext $LogContext `
+                -Level Info `
+                -Step "RegisterInstances" `
+                -Instance $SelectedSourceInstance.ConnectionTarget `
+                -Message "${SqlInstanceName}: $Status"
             $RegistrationResults.Add(
                 [pscustomobject]@{
                     SourceTarget =
                         $SelectedSourceInstance.ConnectionTarget
                     InstanceName = $SqlInstanceName
-                    Status       = $RegistrationStatus
+                    Status       = $Status
+                    Detail       = "Success"
                 }
             )
         }
         catch {
-            # Continue with the remaining selected instances after a failure.
+            Write-SqlMaintenanceLog `
+                -LogContext $LogContext `
+                -Level Error `
+                -Step "RegisterInstances" `
+                -Instance $SelectedSourceInstance.ConnectionTarget `
+                -Message $_.Exception.Message
             $RegistrationResults.Add(
                 [pscustomobject]@{
                     SourceTarget =
                         $SelectedSourceInstance.ConnectionTarget
                     InstanceName = $SqlInstanceName
-                    Status       = "Failed: $($_.Exception.Message)"
+                    Status       = "Failed"
+                    Detail       = $_.Exception.Message
                 }
             )
-        }
-        finally {
-            if ($null -ne $SourceConnection) {
-                $SourceConnection.Dispose()
-            }
         }
     }
 }
 finally {
-    if ($null -ne $RepositoryConnection) {
-        $RepositoryConnection.Dispose()
-    }
-
     $ReadOnlyPassword.Dispose()
+
+    if ($null -ne $LoadedCredentialPassword) {
+        $LoadedCredentialPassword.Dispose()
+    }
 }
 
 Write-Host ""
@@ -495,6 +412,21 @@ Write-Host (
 )
 $RegistrationResults | Format-Table -AutoSize
 
-if ($RegistrationResults.Status -match '^Failed:') {
+$FailedResults = @(
+    $RegistrationResults | Where-Object Status -eq "Failed"
+)
+
+if ($FailedResults.Count -gt 0) {
     throw "One or more SQL Server instances failed to register."
 }
+
+Write-SqlMaintenanceLog `
+    -LogContext $LogContext `
+    -Level Info `
+    -Step "RegisterInstances" `
+    -Message (
+        "Registration completed for " +
+        "$($RegistrationResults.Count) instance(s)."
+    )
+
+$RegistrationResults

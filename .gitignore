@@ -28,3 +28,6 @@ network/admin/
 *.trn
 *.sql.gz
 *.sql.zip
+
+# Local SQL maintenance execution logs
+scripts/MaintanceSql/Logs/

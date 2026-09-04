@@ -16,18 +16,25 @@ errors fail immediately.
 Optional SQL Server connection targets. Supplying this parameter bypasses local
 discovery and the interactive instance menu.
 
+.PARAMETER ConfigPath
+Path to the repository configuration file. The default is repository.config in
+the script directory.
+
 .PARAMETER RepositoryInstance
-SQL Server instance containing the monitoring repository. The default is
-WIN2019LAB. The parameter alias is Ins.
+Optional SQL Server instance that overrides RepositoryInstance in the
+repository configuration file. The parameter alias is Ins.
 
 .PARAMETER RepositoryDatabase
-Repository database name. The default is Monitor.
+Optional database name that overrides RepositoryDatabase in the repository
+configuration file.
 
 .PARAMETER RepositorySchema
-Schema owning the repository table. The default is dbo.
+Optional schema name that overrides RepositorySchema in the repository
+configuration file.
 
 .PARAMETER RepositoryTable
-Table storing SQL Server instance names. The default is InsList.
+Optional table name that overrides RepositoryTable in the repository
+configuration file.
 
 .PARAMETER SqlLoginName
 SQL Login used for source and repository connections. The default is srv.mn.
@@ -53,8 +60,8 @@ validation.
 Uses the supplied instance list without displaying an instance menu.
 
 .NOTES
-The Monitor repository database, table, user mapping, and SELECT/INSERT
-permissions must be created by the separate repository initialization script.
+Run Initialize-SqlMonitorRepository.ps1 first when the repository database,
+schema, table, or srv.mn database user has not been initialized.
 #>
 [CmdletBinding()]
 param(
@@ -62,21 +69,27 @@ param(
     [string[]]$SourceInstance,
 
     [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$ConfigPath = (
+        Join-Path $PSScriptRoot "repository.config"
+    ),
+
+    [Parameter()]
     [Alias("Ins")]
     [ValidateNotNullOrEmpty()]
-    [string]$RepositoryInstance = "WIN2019LAB",
+    [string]$RepositoryInstance,
 
     [Parameter()]
     [ValidatePattern('^[A-Za-z_][A-Za-z0-9_@$#]*$')]
-    [string]$RepositoryDatabase = "Monitor",
+    [string]$RepositoryDatabase,
 
     [Parameter()]
     [ValidatePattern('^[A-Za-z_][A-Za-z0-9_@$#]*$')]
-    [string]$RepositorySchema = "dbo",
+    [string]$RepositorySchema,
 
     [Parameter()]
     [ValidatePattern('^[A-Za-z_][A-Za-z0-9_@$#]*$')]
-    [string]$RepositoryTable = "InsList",
+    [string]$RepositoryTable,
 
     [Parameter()]
     [ValidatePattern('^[A-Za-z0-9._-]+$')]
@@ -123,6 +136,31 @@ if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
 }
 
 Import-Module $CommonModulePath -Force
+
+$RepositoryConfigParameters = @{
+    LiteralPath = $ConfigPath
+}
+
+foreach (
+    $RepositoryParameterName in @(
+        "RepositoryInstance",
+        "RepositoryDatabase",
+        "RepositorySchema",
+        "RepositoryTable"
+    )
+) {
+    if ($PSBoundParameters.ContainsKey($RepositoryParameterName)) {
+        $RepositoryConfigParameters[$RepositoryParameterName] =
+            $PSBoundParameters[$RepositoryParameterName]
+    }
+}
+
+$RepositoryConfig =
+    Get-SqlRepositoryConfig @RepositoryConfigParameters
+$RepositoryInstance = $RepositoryConfig.RepositoryInstance
+$RepositoryDatabase = $RepositoryConfig.RepositoryDatabase
+$RepositorySchema = $RepositoryConfig.RepositorySchema
+$RepositoryTable = $RepositoryConfig.RepositoryTable
 
 if ($null -eq $LogContext) {
     $LogContext = New-SqlMaintenanceLogContext `

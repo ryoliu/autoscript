@@ -5,9 +5,9 @@ registration.
 
 .DESCRIPTION
 The CLI owns one SQL Server instance selection for the entire session. Run All
-performs a repository preflight before any mutation, provisions and validates the
-srv.mn Login on the same selected instances, writes the encrypted credential only
-after all Login validations succeed, and then registers those same instances.
+provisions and validates the srv.mn Login, initializes and validates the
+repository, writes the encrypted credential, and then registers the selected
+instances.
 
 Every action writes human-readable and JSON Lines logs. SQL connection and
 command timeouts and transient retry settings are passed consistently to all
@@ -27,18 +27,29 @@ Service SQL Login name. The default is srv.mn.
 Directory containing the AES key and encrypted credential file. The default is
 E:\Scripts.
 
+.PARAMETER SqlAdminCredential
+Optional fallback SQL administrator credential used when Windows authentication
+cannot provision a Login or initialize the repository.
+
+.PARAMETER ConfigPath
+Path to the repository configuration file. The default is repository.config in
+the script directory.
+
 .PARAMETER RepositoryInstance
-SQL Server instance containing the monitoring repository. The default is
-WIN2019LAB.
+Optional SQL Server instance that overrides RepositoryInstance in the
+repository configuration file.
 
 .PARAMETER RepositoryDatabase
-Monitoring repository database. The default is Monitor.
+Optional database name that overrides RepositoryDatabase in the repository
+configuration file.
 
 .PARAMETER RepositorySchema
-Schema owning the instance table. The default is dbo.
+Optional schema name that overrides RepositorySchema in the repository
+configuration file.
 
 .PARAMETER RepositoryTable
-Table storing SQL Server instance names. The default is InsList.
+Optional table name that overrides RepositoryTable in the repository
+configuration file.
 
 .EXAMPLE
 .\Start-SqlMaintenanceCli.ps1
@@ -52,6 +63,12 @@ Displays the interactive SQL maintenance menu.
 
 Runs the complete workflow for the supplied instances without displaying an
 instance selection menu.
+
+.EXAMPLE
+.\Start-SqlMaintenanceCli.ps1 -Action InitializeRepository
+
+Creates missing repository objects, maps srv.mn, adds it to db_owner, and
+validates the repository.
 #>
 [CmdletBinding()]
 param(
@@ -59,6 +76,7 @@ param(
     [ValidateSet(
         "Menu",
         "ProvisionLogin",
+        "InitializeRepository",
         "CreateCredential",
         "RegisterInstances",
         "RunAll"
@@ -77,21 +95,30 @@ param(
     [string]$CredentialDirectory = "E:\Scripts",
 
     [Parameter()]
+    [PSCredential]$SqlAdminCredential,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$ConfigPath = (
+        Join-Path $PSScriptRoot "repository.config"
+    ),
+
+    [Parameter()]
     [Alias("Ins")]
     [ValidateNotNullOrEmpty()]
-    [string]$RepositoryInstance = "WIN2019LAB",
+    [string]$RepositoryInstance,
 
     [Parameter()]
     [ValidatePattern('^[A-Za-z_][A-Za-z0-9_@$#]*$')]
-    [string]$RepositoryDatabase = "Monitor",
+    [string]$RepositoryDatabase,
 
     [Parameter()]
     [ValidatePattern('^[A-Za-z_][A-Za-z0-9_@$#]*$')]
-    [string]$RepositorySchema = "dbo",
+    [string]$RepositorySchema,
 
     [Parameter()]
     [ValidatePattern('^[A-Za-z_][A-Za-z0-9_@$#]*$')]
-    [string]$RepositoryTable = "InsList",
+    [string]$RepositoryTable,
 
     [Parameter()]
     [ValidateRange(1, 300)]
@@ -122,6 +149,8 @@ $ProvisionLoginScript =
     Join-Path $PSScriptRoot "New-SqlServiceLogin.ps1"
 $CreateCredentialScript =
     Join-Path $PSScriptRoot "New-SqlCredentialKey.ps1"
+$InitializeRepositoryScript =
+    Join-Path $PSScriptRoot "Initialize-SqlMonitorRepository.ps1"
 $RegisterInstancesScript =
     Join-Path $PSScriptRoot "getInstanceName.ps1"
 
@@ -130,6 +159,31 @@ if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
 }
 
 Import-Module $CommonModulePath -Force
+
+$RepositoryConfigParameters = @{
+    LiteralPath = $ConfigPath
+}
+
+foreach (
+    $RepositoryParameterName in @(
+        "RepositoryInstance",
+        "RepositoryDatabase",
+        "RepositorySchema",
+        "RepositoryTable"
+    )
+) {
+    if ($PSBoundParameters.ContainsKey($RepositoryParameterName)) {
+        $RepositoryConfigParameters[$RepositoryParameterName] =
+            $PSBoundParameters[$RepositoryParameterName]
+    }
+}
+
+$RepositoryConfig =
+    Get-SqlRepositoryConfig @RepositoryConfigParameters
+$RepositoryInstance = $RepositoryConfig.RepositoryInstance
+$RepositoryDatabase = $RepositoryConfig.RepositoryDatabase
+$RepositorySchema = $RepositoryConfig.RepositorySchema
+$RepositoryTable = $RepositoryConfig.RepositoryTable
 
 $LogContext = New-SqlMaintenanceLogContext `
     -LogDirectory $LogDirectory `
@@ -207,30 +261,6 @@ function Get-SessionServiceCredential {
     return $script:ServiceCredential
 }
 
-function Invoke-RepositoryPreflight {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [PSCredential]$Credential
-    )
-
-    Write-Host ""
-    Write-Host "Preflight - Validate Monitor repository"
-    [void](
-        Test-SqlMonitorRepository `
-            -RepositoryInstance $RepositoryInstance `
-            -RepositoryDatabase $RepositoryDatabase `
-            -RepositorySchema $RepositorySchema `
-            -RepositoryTable $RepositoryTable `
-            -Credential $Credential `
-            -ConnectionTimeoutSeconds $ConnectionTimeoutSeconds `
-            -CommandTimeoutSeconds $CommandTimeoutSeconds `
-            -RetryCount $RetryCount `
-            -RetryDelaySeconds $RetryDelaySeconds `
-            -LogContext $LogContext
-    )
-}
-
 function Invoke-ProvisionLogin {
     [CmdletBinding()]
     param(
@@ -244,18 +274,68 @@ function Invoke-ProvisionLogin {
     Assert-SupportingScript -LiteralPath $ProvisionLoginScript
     Write-Host ""
     Write-Host "Step 1 - Provision and validate SQL Login [$SqlLoginName]"
-    [void](
-        & $ProvisionLoginScript `
-            -SourceInstance $SelectedInstances.ConnectionTarget `
-            -ServiceLoginName $SqlLoginName `
-            -ServiceCredential $ServiceCredential `
-            -ConnectionTimeoutSeconds $ConnectionTimeoutSeconds `
-            -CommandTimeoutSeconds $CommandTimeoutSeconds `
-            -RetryCount $RetryCount `
-            -RetryDelaySeconds $RetryDelaySeconds `
-            -LogDirectory $LogDirectory `
-            -LogContext $LogContext
+    $ProvisioningTargets = @(
+        @($SelectedInstances.ConnectionTarget) + @($RepositoryInstance) |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace($_)
+            } |
+            Select-Object -Unique
     )
+    $ProvisioningParameters = @{
+        SourceInstance           = $ProvisioningTargets
+        ServiceLoginName         = $SqlLoginName
+        ServiceCredential        = $ServiceCredential
+        ConnectionTimeoutSeconds = $ConnectionTimeoutSeconds
+        CommandTimeoutSeconds    = $CommandTimeoutSeconds
+        RetryCount               = $RetryCount
+        RetryDelaySeconds        = $RetryDelaySeconds
+        LogDirectory             = $LogDirectory
+        LogContext               = $LogContext
+    }
+
+    if ($null -ne $SqlAdminCredential) {
+        $ProvisioningParameters.SqlAdminCredential =
+            $SqlAdminCredential
+    }
+
+    [void](& $ProvisionLoginScript @ProvisioningParameters)
+}
+
+function Invoke-InitializeRepository {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [PSCredential]$ServiceCredential
+    )
+
+    Assert-SupportingScript -LiteralPath $InitializeRepositoryScript
+    Write-Host ""
+    Write-Host (
+        "Step 2 - Initialize and validate repository " +
+        "[$RepositoryDatabase]"
+    )
+    $InitializationParameters = @{
+        ConfigPath               = $ConfigPath
+        RepositoryInstance       = $RepositoryInstance
+        RepositoryDatabase       = $RepositoryDatabase
+        RepositorySchema         = $RepositorySchema
+        RepositoryTable          = $RepositoryTable
+        SqlLoginName             = $SqlLoginName
+        ServiceCredential        = $ServiceCredential
+        ConnectionTimeoutSeconds = $ConnectionTimeoutSeconds
+        CommandTimeoutSeconds    = $CommandTimeoutSeconds
+        RetryCount               = $RetryCount
+        RetryDelaySeconds        = $RetryDelaySeconds
+        LogDirectory             = $LogDirectory
+        LogContext               = $LogContext
+    }
+
+    if ($null -ne $SqlAdminCredential) {
+        $InitializationParameters.SqlAdminCredential =
+            $SqlAdminCredential
+    }
+
+    [void](& $InitializeRepositoryScript @InitializationParameters)
 }
 
 function Invoke-CreateCredential {
@@ -270,7 +350,7 @@ function Invoke-CreateCredential {
 
     Assert-SupportingScript -LiteralPath $CreateCredentialScript
     Write-Host ""
-    Write-Host "Step 2 - Create encrypted SQL credential"
+    Write-Host "Step 3 - Create encrypted SQL credential"
 
     $KeyPath = Join-Path $CredentialDirectory "$SqlLoginName.key"
     $CredentialPath =
@@ -322,12 +402,13 @@ function Invoke-RegisterInstances {
 
     Assert-SupportingScript -LiteralPath $RegisterInstancesScript
     Write-Host ""
-    Write-Host "Step 3 - Register SQL Server instances"
+    Write-Host "Step 4 - Register SQL Server instances"
     [void](
         & $RegisterInstancesScript `
             -SourceInstance $SelectedInstances.ConnectionTarget `
             -SqlLoginName $SqlLoginName `
             -CredentialDirectory $CredentialDirectory `
+            -ConfigPath $ConfigPath `
             -RepositoryInstance $RepositoryInstance `
             -RepositoryDatabase $RepositoryDatabase `
             -RepositorySchema $RepositorySchema `
@@ -348,11 +429,10 @@ function Invoke-AllSqlMaintenanceSteps {
     $SelectedInstances = @(Get-SessionSqlInstanceSelection)
     $Credential = Get-SessionServiceCredential
 
-    # Repository readiness is checked before Login or credential mutation.
-    Invoke-RepositoryPreflight -Credential $Credential
     Invoke-ProvisionLogin `
         -SelectedInstances $SelectedInstances `
         -ServiceCredential $Credential
+    Invoke-InitializeRepository -ServiceCredential $Credential
     Invoke-CreateCredential `
         -Credential $Credential `
         -RequireCompletion
@@ -365,6 +445,7 @@ function Invoke-SqlMaintenanceAction {
         [Parameter(Mandatory)]
         [ValidateSet(
             "ProvisionLogin",
+            "InitializeRepository",
             "CreateCredential",
             "RegisterInstances",
             "RunAll"
@@ -385,6 +466,10 @@ function Invoke-SqlMaintenanceAction {
             Invoke-ProvisionLogin `
                 -SelectedInstances $SelectedInstances `
                 -ServiceCredential $Credential
+        }
+        "InitializeRepository" {
+            $Credential = Get-SessionServiceCredential
+            Invoke-InitializeRepository -ServiceCredential $Credential
         }
         "CreateCredential" {
             Invoke-CreateCredential
@@ -430,9 +515,10 @@ while ($true) {
     Write-Host "SQL Maintenance CLI"
     Write-Host "==================="
     Write-Host "1. Create $SqlLoginName SQL Login and permissions"
-    Write-Host "2. Create or replace encrypted $SqlLoginName credential"
-    Write-Host "3. Select and register SQL Server instances"
-    Write-Host "4. Run steps 1-3 in order"
+    Write-Host "2. Initialize repository database and table"
+    Write-Host "3. Create or replace encrypted $SqlLoginName credential"
+    Write-Host "4. Select and register SQL Server instances"
+    Write-Host "5. Run steps 1-4 in order"
     Write-Host "Q. Exit"
     Write-Host ""
 
@@ -449,9 +535,10 @@ while ($true) {
 
     $SelectedAction = switch ($MenuSelection) {
         "1" { "ProvisionLogin" }
-        "2" { "CreateCredential" }
-        "3" { "RegisterInstances" }
-        "4" { "RunAll" }
+        "2" { "InitializeRepository" }
+        "3" { "CreateCredential" }
+        "4" { "RegisterInstances" }
+        "5" { "RunAll" }
         default { $null }
     }
 

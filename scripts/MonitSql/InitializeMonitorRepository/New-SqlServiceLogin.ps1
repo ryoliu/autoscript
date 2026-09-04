@@ -59,8 +59,8 @@ selection menu.
 
 .NOTES
 This Agent script intentionally grants only server and msdb permissions. The
-Monitor repository database, table, user mapping, and object permissions are
-owned by a separate repository initialization script.
+Monitor repository database, table, user mapping, and db_owner membership are
+owned by Initialize-SqlMonitorRepository.ps1.
 #>
 [CmdletBinding()]
 param(

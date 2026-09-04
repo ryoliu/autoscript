@@ -1,6 +1,146 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Get-SqlRepositoryConfig {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$LiteralPath,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$RepositoryInstance,
+
+        [Parameter()]
+        [ValidatePattern('^[A-Za-z_][A-Za-z0-9_@$#]*$')]
+        [string]$RepositoryDatabase,
+
+        [Parameter()]
+        [ValidatePattern('^[A-Za-z_][A-Za-z0-9_@$#]*$')]
+        [string]$RepositorySchema,
+
+        [Parameter()]
+        [ValidatePattern('^[A-Za-z_][A-Za-z0-9_@$#]*$')]
+        [string]$RepositoryTable
+    )
+
+    if (-not (Test-Path -LiteralPath $LiteralPath -PathType Leaf)) {
+        throw "Repository configuration file not found: $LiteralPath"
+    }
+
+    $RequiredKeys = @(
+        "RepositoryInstance",
+        "RepositoryDatabase",
+        "RepositorySchema",
+        "RepositoryTable"
+    )
+    $FileValues = @{}
+    $LineNumber = 0
+
+    foreach (
+        $ConfigLine in Get-Content `
+            -LiteralPath $LiteralPath `
+            -Encoding UTF8
+    ) {
+        $LineNumber++
+        $TrimmedLine = $ConfigLine.Trim()
+
+        if (
+            [string]::IsNullOrWhiteSpace($TrimmedLine) -or
+            $TrimmedLine.StartsWith("#")
+        ) {
+            continue
+        }
+
+        $SeparatorIndex = $TrimmedLine.IndexOf("=")
+
+        if ($SeparatorIndex -lt 1) {
+            throw (
+                "Invalid repository configuration at " +
+                "[$LiteralPath] line $LineNumber. Expected Key=Value."
+            )
+        }
+
+        $Key = $TrimmedLine.Substring(0, $SeparatorIndex).Trim()
+        $Value = $TrimmedLine.Substring($SeparatorIndex + 1).Trim()
+
+        if ($RequiredKeys -notcontains $Key) {
+            throw (
+                "Unknown repository configuration key [$Key] at " +
+                "[$LiteralPath] line $LineNumber."
+            )
+        }
+
+        if ($FileValues.ContainsKey($Key)) {
+            throw (
+                "Duplicate repository configuration key [$Key] at " +
+                "[$LiteralPath] line $LineNumber."
+            )
+        }
+
+        if ([string]::IsNullOrWhiteSpace($Value)) {
+            throw (
+                "Repository configuration key [$Key] has no value at " +
+                "[$LiteralPath] line $LineNumber."
+            )
+        }
+
+        $FileValues[$Key] = $Value
+    }
+
+    foreach ($RequiredKey in $RequiredKeys) {
+        if (-not $FileValues.ContainsKey($RequiredKey)) {
+            throw (
+                "Required repository configuration key [$RequiredKey] " +
+                "not found in [$LiteralPath]."
+            )
+        }
+    }
+
+    foreach (
+        $SqlIdentifierKey in @(
+            "RepositoryDatabase",
+            "RepositorySchema",
+            "RepositoryTable"
+        )
+    ) {
+        if (
+            $FileValues[$SqlIdentifierKey] `
+                -notmatch '^[A-Za-z_][A-Za-z0-9_@$#]*$'
+        ) {
+            throw (
+                "Invalid SQL identifier [$($FileValues[$SqlIdentifierKey])] " +
+                "for repository configuration key [$SqlIdentifierKey] in " +
+                "[$LiteralPath]."
+            )
+        }
+    }
+
+    if ($PSBoundParameters.ContainsKey("RepositoryInstance")) {
+        $FileValues.RepositoryInstance = $RepositoryInstance
+    }
+
+    if ($PSBoundParameters.ContainsKey("RepositoryDatabase")) {
+        $FileValues.RepositoryDatabase = $RepositoryDatabase
+    }
+
+    if ($PSBoundParameters.ContainsKey("RepositorySchema")) {
+        $FileValues.RepositorySchema = $RepositorySchema
+    }
+
+    if ($PSBoundParameters.ContainsKey("RepositoryTable")) {
+        $FileValues.RepositoryTable = $RepositoryTable
+    }
+
+    [pscustomobject]@{
+        RepositoryInstance = [string]$FileValues.RepositoryInstance
+        RepositoryDatabase = [string]$FileValues.RepositoryDatabase
+        RepositorySchema   = [string]$FileValues.RepositorySchema
+        RepositoryTable    = [string]$FileValues.RepositoryTable
+    }
+}
+
 function New-SqlMaintenanceLogContext {
     [CmdletBinding()]
     param(
@@ -672,6 +812,7 @@ SELECT
         HAS_PERMS_BY_NAME(@QualifiedTable, N'OBJECT', N'INSERT'),
         0
     ) AS [CanInsert],
+    ISNULL(IS_ROLEMEMBER(N'db_owner'), 0) AS [IsDbOwner],
     TYPE_NAME([system_type_id]) AS [DataType],
     CASE
         WHEN TYPE_NAME([system_type_id]) IN (N'nchar', N'nvarchar')
@@ -704,6 +845,8 @@ WHERE [object_id] = @ObjectId
                                 TableObjectId = [int]$Reader["TableObjectId"]
                                 CanSelect = [int]$Reader["CanSelect"] -eq 1
                                 CanInsert = [int]$Reader["CanInsert"] -eq 1
+                                IsDbOwner =
+                                    [int]$Reader["IsDbOwner"] -eq 1
                                 DataType = [string]$Reader["DataType"]
                                 CharacterLength =
                                     [int]$Reader["CharacterLength"]
@@ -739,6 +882,13 @@ WHERE [object_id] = @ObjectId
             )
         }
 
+        if (-not $ObjectResult.IsDbOwner) {
+            throw (
+                "SQL Login [$($Credential.UserName)] must be a member of " +
+                "db_owner in repository database [$RepositoryDatabase]."
+            )
+        }
+
         if (-not $ObjectResult.CanSelect -or -not $ObjectResult.CanInsert) {
             throw (
                 "SQL Login [$($Credential.UserName)] requires SELECT and " +
@@ -755,7 +905,7 @@ WHERE [object_id] = @ObjectId
                 "Repository is ready: " +
                 "$RepositoryDatabase.$QualifiedTable; " +
                 "InsName=$($ObjectResult.DataType)" +
-                "($($ObjectResult.CharacterLength))."
+                "($($ObjectResult.CharacterLength)); db_owner=True."
             )
 
         [pscustomobject]@{
@@ -765,6 +915,7 @@ WHERE [object_id] = @ObjectId
             DatabaseState       = $DatabaseResult.State
             CanSelect           = $ObjectResult.CanSelect
             CanInsert           = $ObjectResult.CanInsert
+            IsDbOwner           = $ObjectResult.IsDbOwner
             InsNameDataType     = $ObjectResult.DataType
             InsNameLength       = $ObjectResult.CharacterLength
             IsReady             = $true
@@ -776,6 +927,7 @@ WHERE [object_id] = @ObjectId
 }
 
 Export-ModuleMember -Function @(
+    "Get-SqlRepositoryConfig",
     "Get-LocalSqlInstance",
     "Select-SqlInstance",
     "New-SqlConnection",

@@ -23,7 +23,7 @@ New-SqlCredentialKey.ps1 are loaded from CredentialDirectory.
 
 .PARAMETER ConfigPath
 Path to repository.config. The default is the configuration file under the
-sibling InitializeMonitorRepository directory.
+shared Config directory.
 
 .PARAMETER RepositoryInstance
 Optional override for RepositoryInstance in repository.config.
@@ -43,7 +43,7 @@ SQL Login whose stored credential is loaded. The default is srv.mn.
 
 .PARAMETER CredentialDirectory
 Directory containing <SqlLoginName>.key and
-<SqlLoginName>.credential.xml. The default is E:\Scripts.
+<SqlLoginName>.credential.xml. The default is the shared Credentials directory.
 
 .PARAMETER Credential
 Optional credential used instead of the encrypted credential files.
@@ -74,6 +74,12 @@ Maximum number of query hashes requested for each of CPU, IO, and Duration.
 
 .PARAMETER OutputDirectory
 Parent directory for timestamped result directories.
+
+.PARAMETER TrustServerCertificate
+Controls whether dbatools accepts SQL Server certificates whose chain is not
+trusted by the local computer. The default is true for lab and self-signed
+certificates. This setting applies only while this script runs and is restored
+after collection completes.
 
 .EXAMPLE
 .\Get-SqlPerformanceInfo.ps1
@@ -108,8 +114,9 @@ param(
     [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$ConfigPath = (
-        Join-Path $PSScriptRoot `
-            "..\InitializeMonitorRepository\repository.config"
+        Join-Path `
+            (Split-Path -Parent $PSScriptRoot) `
+            "Config\repository.config"
     ),
 
     [Parameter()]
@@ -135,7 +142,11 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$CredentialDirectory = "E:\Scripts",
+    [string]$CredentialDirectory = (
+        Join-Path `
+            (Split-Path -Parent $PSScriptRoot) `
+            "Credentials"
+    ),
 
     [Parameter()]
     [PSCredential]$Credential,
@@ -162,6 +173,9 @@ param(
     [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$OutputDirectory = (Join-Path $PSScriptRoot "Output"),
+
+    [Parameter()]
+    [bool]$TrustServerCertificate = $true,
 
     [Parameter()]
     [ValidateRange(1, 300)]
@@ -505,6 +519,7 @@ function Add-CollectionError {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [System.Collections.Generic.List[object]]$ErrorList,
 
         [Parameter(Mandatory)]
@@ -632,12 +647,9 @@ ORDER BY [InsName];
     return @($Names)
 }
 
-$InitializeDirectory = Join-Path `
-    (Split-Path -Parent $PSScriptRoot) `
-    "InitializeMonitorRepository"
 $CommonModulePath = Join-Path `
-    $InitializeDirectory `
-    "SqlMaintenance.Common.psm1"
+    (Split-Path -Parent $PSScriptRoot) `
+    "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
 
 if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
     throw "Required module not found: $CommonModulePath"
@@ -651,7 +663,9 @@ $RequiredDbatoolsCommands = @(
     "Get-DbaHelpIndex",
     "Find-DbaDbDuplicateIndex",
     "Find-DbaDbUnusedIndex",
-    "Get-DbaTopResourceUsage"
+    "Get-DbaTopResourceUsage",
+    "Get-DbatoolsConfigValue",
+    "Set-DbatoolsConfig"
 )
 
 try {
@@ -711,6 +725,9 @@ $LogContext = New-SqlMaintenanceLogContext `
 $LoadedSecurePassword = $null
 $ReadOnlyPassword = $null
 $RepositorySqlCredential = $null
+$DbatoolsTrustCertificateConfigName = "sql.connection.trustcert"
+$PreviousDbatoolsTrustCertificate = $null
+$DbatoolsTrustCertificateConfigured = $false
 $CollectionErrors = [System.Collections.Generic.List[object]]::new()
 $RunSummary = [System.Collections.Generic.List[object]]::new()
 
@@ -726,6 +743,13 @@ $OutputPaths = @{
 }
 
 try {
+    $PreviousDbatoolsTrustCertificate = Get-DbatoolsConfigValue `
+        -FullName $DbatoolsTrustCertificateConfigName
+    Set-DbatoolsConfig `
+        -FullName $DbatoolsTrustCertificateConfigName `
+        -Value $TrustServerCertificate
+    $DbatoolsTrustCertificateConfigured = $true
+
     if ($null -eq $Credential) {
         $LoadedCredential = Import-StoredSqlCredential `
             -LoginName $SqlLoginName `
@@ -846,7 +870,11 @@ try {
             $DatabaseObjects = @(
                 Get-DbaDatabase @DatabaseParameters
             )
-            $DatabaseNames = @($DatabaseObjects.Name)
+            $DatabaseNames = @(
+                foreach ($DatabaseObject in $DatabaseObjects) {
+                    $DatabaseObject.Name
+                }
+            )
             $DatabaseCount = $DatabaseNames.Count
 
             if ($DatabaseCount -eq 0) {
@@ -1482,6 +1510,21 @@ try {
     }
 }
 finally {
+    if ($DbatoolsTrustCertificateConfigured) {
+        try {
+            Set-DbatoolsConfig `
+                -FullName $DbatoolsTrustCertificateConfigName `
+                -Value $PreviousDbatoolsTrustCertificate
+        }
+        catch {
+            Write-Warning (
+                "Could not restore dbatools setting " +
+                "[$DbatoolsTrustCertificateConfigName]: " +
+                $_.Exception.Message
+            )
+        }
+    }
+
     $RepositorySqlCredential = $null
 
     if ($null -ne $ReadOnlyPassword) {

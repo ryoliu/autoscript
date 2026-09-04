@@ -14,6 +14,10 @@ applied idempotently, and the supplied service credential is then used to make a
 real SQL connection to every selected instance. Existing Login passwords are not
 changed; a mismatched stored password causes validation to fail.
 
+CONNECT ANY DATABASE is granted so the monitoring Login can connect to current
+and future user databases without requiring an individual user mapping in each
+database.
+
 .PARAMETER SourceInstance
 Optional SQL Server connection targets. Supplying this parameter bypasses local
 discovery and the interactive instance menu.
@@ -104,7 +108,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$CommonModulePath = Join-Path $PSScriptRoot "SqlMaintenance.Common.psm1"
+$CommonModulePath = Join-Path `
+    (Split-Path -Parent $PSScriptRoot) `
+    "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
 
 if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
     throw "Required module not found: $CommonModulePath"
@@ -488,6 +494,7 @@ WITH
                                 $CommandTimeoutSeconds
                             $GrantCommand.CommandText = @"
 GRANT CONNECT SQL TO [$ServiceLoginName];
+GRANT CONNECT ANY DATABASE TO [$ServiceLoginName];
 GRANT VIEW ANY DATABASE TO [$ServiceLoginName];
 GRANT VIEW ANY DEFINITION TO [$ServiceLoginName];
 GRANT VIEW SERVER STATE TO [$ServiceLoginName];

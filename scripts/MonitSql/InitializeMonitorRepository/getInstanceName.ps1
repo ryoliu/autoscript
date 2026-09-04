@@ -18,7 +18,7 @@ discovery and the interactive instance menu.
 
 .PARAMETER ConfigPath
 Path to the repository configuration file. The default is repository.config in
-the script directory.
+the shared Config directory.
 
 .PARAMETER RepositoryInstance
 Optional SQL Server instance that overrides RepositoryInstance in the
@@ -41,7 +41,7 @@ SQL Login used for source and repository connections. The default is srv.mn.
 
 .PARAMETER CredentialDirectory
 Directory containing the AES key and encrypted credential files. The default is
-E:\Scripts.
+the shared Credentials directory.
 
 .PARAMETER Credential
 Optional SQL Login credential that overrides the stored credential files.
@@ -71,7 +71,9 @@ param(
     [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$ConfigPath = (
-        Join-Path $PSScriptRoot "repository.config"
+        Join-Path `
+            (Split-Path -Parent $PSScriptRoot) `
+            "Config\repository.config"
     ),
 
     [Parameter()]
@@ -97,7 +99,11 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$CredentialDirectory = "E:\Scripts",
+    [string]$CredentialDirectory = (
+        Join-Path `
+            (Split-Path -Parent $PSScriptRoot) `
+            "Credentials"
+    ),
 
     [Parameter()]
     [PSCredential]$Credential,
@@ -129,7 +135,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$CommonModulePath = Join-Path $PSScriptRoot "SqlMaintenance.Common.psm1"
+$CommonModulePath = Join-Path `
+    (Split-Path -Parent $PSScriptRoot) `
+    "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
 
 if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
     throw "Required module not found: $CommonModulePath"

@@ -5,7 +5,8 @@ Creates an AES key and an encrypted SQL Login credential file.
 .DESCRIPTION
 Prompts for a SQL Login credential, creates a 256-bit AES key, and stores the
 password as an encrypted SecureString. The key and credential files are created
-under E:\Scripts by default.
+under the shared Credentials directory by default. The directory is created
+automatically when it does not exist.
 
 File access is restricted to the current Windows account, Local System, and the
 local Administrators group. Both files are required to decrypt the password.
@@ -15,7 +16,7 @@ SQL Login name stored in the credential file. The default is srv.mn.
 
 .PARAMETER CredentialDirectory
 Directory in which the key and credential files are created. The default is
-E:\Scripts.
+the shared Credentials directory.
 
 .PARAMETER Credential
 Optional credential supplied by the caller. When omitted, Get-Credential opens
@@ -50,7 +51,11 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$CredentialDirectory = "E:\Scripts",
+    [string]$CredentialDirectory = (
+        Join-Path `
+            (Split-Path -Parent $PSScriptRoot) `
+            "Credentials"
+    ),
 
     [Parameter()]
     [PSCredential]$Credential,
@@ -69,7 +74,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$CommonModulePath = Join-Path $PSScriptRoot "SqlMaintenance.Common.psm1"
+$CommonModulePath = Join-Path `
+    (Split-Path -Parent $PSScriptRoot) `
+    "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
 
 if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
     throw "Required module not found: $CommonModulePath"

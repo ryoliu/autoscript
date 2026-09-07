@@ -33,7 +33,8 @@ function Get-SqlRepositoryConfig {
         "RepositoryInstance",
         "RepositoryDatabase",
         "RepositorySchema",
-        "RepositoryTable"
+        "RepositoryTable",
+        "SqlLoginName"
     )
     $FileValues = @{}
     $LineNumber = 0
@@ -117,6 +118,13 @@ function Get-SqlRepositoryConfig {
         }
     }
 
+    if ($FileValues.SqlLoginName -notmatch '^[A-Za-z0-9._-]+$') {
+        throw (
+            "Invalid SQL Login name [$($FileValues.SqlLoginName)] for " +
+            "repository configuration key [SqlLoginName] in [$LiteralPath]."
+        )
+    }
+
     if ($PSBoundParameters.ContainsKey("RepositoryInstance")) {
         $FileValues.RepositoryInstance = $RepositoryInstance
     }
@@ -138,6 +146,7 @@ function Get-SqlRepositoryConfig {
         RepositoryDatabase = [string]$FileValues.RepositoryDatabase
         RepositorySchema   = [string]$FileValues.RepositorySchema
         RepositoryTable    = [string]$FileValues.RepositoryTable
+        SqlLoginName       = [string]$FileValues.SqlLoginName
     }
 }
 

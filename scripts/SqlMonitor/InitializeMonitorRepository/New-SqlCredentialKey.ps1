@@ -12,7 +12,11 @@ File access is restricted to the current Windows account, Local System, and the
 local Administrators group. Both files are required to decrypt the password.
 
 .PARAMETER SqlLoginName
-SQL Login name stored in the credential file. The default is srv.mn.
+Optional SQL Login name stored in the credential file. It overrides
+SqlLoginName in repository.config.
+
+.PARAMETER ConfigPath
+Path to repository.config, which supplies the default SqlLoginName.
 
 .PARAMETER CredentialDirectory
 Directory in which the key and credential files are created. The default is
@@ -31,12 +35,12 @@ Directory for text and JSON Lines execution logs.
 .EXAMPLE
 .\New-SqlCredentialKey.ps1
 
-Prompts for the srv.mn password and creates the default credential files.
+Prompts for the configured service Login password and creates the credential files.
 
 .EXAMPLE
 .\New-SqlCredentialKey.ps1 -Force
 
-Replaces the existing srv.mn key and credential files after prompting for the
+Replaces the existing service Login key and credential files after prompting for the
 current password.
 
 .NOTES
@@ -47,13 +51,21 @@ protected and do not commit either file to source control.
 param(
     [Parameter()]
     [ValidatePattern('^[A-Za-z0-9._-]+$')]
-    [string]$SqlLoginName = "srv.mn",
+    [string]$SqlLoginName,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$ConfigPath = (
+        Join-Path `
+            (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) `
+            "Config\repository.config"
+    ),
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$CredentialDirectory = (
         Join-Path `
-            (Split-Path -Parent $PSScriptRoot) `
+            (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) `
             "Credentials"
     ),
 
@@ -83,6 +95,12 @@ if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
 }
 
 Import-Module $CommonModulePath -Force
+
+$RepositoryConfig = Get-SqlRepositoryConfig -LiteralPath $ConfigPath
+
+if (-not $PSBoundParameters.ContainsKey("SqlLoginName")) {
+    $SqlLoginName = $RepositoryConfig.SqlLoginName
+}
 
 if ($null -eq $LogContext) {
     $LogContext = New-SqlMaintenanceLogContext `

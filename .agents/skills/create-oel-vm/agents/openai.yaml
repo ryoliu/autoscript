@@ -1,0 +1,7 @@
+interface:
+  display_name: "Create OEL VM"
+  short_description: "Create Oracle Linux VirtualBox VMs from local ISO media."
+  default_prompt: "Use $create-oel-vm to create an Oracle Linux VM from a local ISO with NAT networking and a dynamic VDI disk."
+
+policy:
+  allow_implicit_invocation: true

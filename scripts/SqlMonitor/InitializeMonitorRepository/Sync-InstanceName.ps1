@@ -4,7 +4,7 @@ Registers selected SQL Server instance names in a central monitoring table.
 
 .DESCRIPTION
 Uses one shared instance selection supplied by the CLI, or discovers and selects
-local instances when run independently. The script loads the encrypted srv.mn
+local instances when run independently. The script loads the encrypted service
 credential, validates the Monitor repository before any write, retrieves each
 SQL Server instance name with T-SQL, and inserts names that do not already exist.
 
@@ -37,7 +37,8 @@ Optional table name that overrides RepositoryTable in the repository
 configuration file.
 
 .PARAMETER SqlLoginName
-SQL Login used for source and repository connections. The default is srv.mn.
+Optional SQL Login used for source and repository connections. It overrides
+SqlLoginName in repository.config.
 
 .PARAMETER CredentialDirectory
 Directory containing the AES key and encrypted credential files. The default is
@@ -47,13 +48,13 @@ the shared Credentials directory.
 Optional SQL Login credential that overrides the stored credential files.
 
 .EXAMPLE
-.\getInstanceName.ps1
+.\Sync-InstanceName.ps1
 
 Selects local SQL Server instances and registers them after repository
 validation.
 
 .EXAMPLE
-.\getInstanceName.ps1 `
+.\Sync-InstanceName.ps1 `
     -SourceInstance "localhost","localhost\LAB2" `
     -RepositoryInstance "WIN2019LAB"
 
@@ -61,7 +62,7 @@ Uses the supplied instance list without displaying an instance menu.
 
 .NOTES
 Run Initialize-SqlMonitorRepository.ps1 first when the repository database,
-schema, table, or srv.mn database user has not been initialized.
+schema, table, or configured service database user has not been initialized.
 #>
 [CmdletBinding()]
 param(
@@ -72,7 +73,7 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$ConfigPath = (
         Join-Path `
-            (Split-Path -Parent $PSScriptRoot) `
+            (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) `
             "Config\repository.config"
     ),
 
@@ -95,13 +96,13 @@ param(
 
     [Parameter()]
     [ValidatePattern('^[A-Za-z0-9._-]+$')]
-    [string]$SqlLoginName = "srv.mn",
+    [string]$SqlLoginName,
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$CredentialDirectory = (
         Join-Path `
-            (Split-Path -Parent $PSScriptRoot) `
+            (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) `
             "Credentials"
     ),
 
@@ -169,6 +170,10 @@ $RepositoryInstance = $RepositoryConfig.RepositoryInstance
 $RepositoryDatabase = $RepositoryConfig.RepositoryDatabase
 $RepositorySchema = $RepositoryConfig.RepositorySchema
 $RepositoryTable = $RepositoryConfig.RepositoryTable
+
+if (-not $PSBoundParameters.ContainsKey("SqlLoginName")) {
+    $SqlLoginName = $RepositoryConfig.SqlLoginName
+}
 
 if ($null -eq $LogContext) {
     $LogContext = New-SqlMaintenanceLogContext `

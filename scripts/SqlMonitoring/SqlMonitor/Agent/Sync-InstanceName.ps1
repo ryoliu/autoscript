@@ -3,10 +3,11 @@
 Registers selected SQL Server instance names in a central monitoring table.
 
 .DESCRIPTION
-Uses one shared instance selection supplied by the CLI, or discovers and selects
-local instances when run independently. The script loads the encrypted service
-credential, validates the Monitor repository before any write, retrieves each
-SQL Server instance name with T-SQL, and inserts names that do not already exist.
+Uses one shared instance selection supplied by the Agent setup script, or
+discovers and selects local instances when run independently. The script loads
+the encrypted service credential copied from ServerRepository, validates the
+Monitor repository before any write, retrieves each SQL Server instance name
+with T-SQL, and inserts names that do not already exist.
 
 SQL connections and commands use configurable timeouts. Only transient SQL or
 network failures are retried; authentication, permission, schema, and credential
@@ -61,8 +62,9 @@ validation.
 Uses the supplied instance list without displaying an instance menu.
 
 .NOTES
-Run Initialize-SqlMonitorRepository.ps1 first when the repository database,
-schema, table, or configured service database user has not been initialized.
+The AES key and encrypted credential XML must be generated on ServerRepository
+and manually copied to this Agent as a matching pair. Initialize the repository
+on ServerRepository before registering instances.
 #>
 [CmdletBinding()]
 param(
@@ -199,15 +201,15 @@ if ($null -eq $Credential) {
 
     if (-not (Test-Path -LiteralPath $KeyPath -PathType Leaf)) {
         throw (
-            "SQL credential key not found: $KeyPath. Run " +
-            "New-SqlCredentialKey.ps1 first."
+            "SQL credential key not found: $KeyPath. Copy the matching key " +
+            "and credential XML files from ServerRepository."
         )
     }
 
     if (-not (Test-Path -LiteralPath $CredentialPath -PathType Leaf)) {
         throw (
-            "Encrypted SQL credential not found: $CredentialPath. Run " +
-            "New-SqlCredentialKey.ps1 first."
+            "Encrypted SQL credential not found: $CredentialPath. Copy the " +
+            "matching key and credential XML files from ServerRepository."
         )
     }
 

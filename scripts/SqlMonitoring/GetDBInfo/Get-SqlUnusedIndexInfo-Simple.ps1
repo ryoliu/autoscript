@@ -57,49 +57,7 @@ ORDER BY InsName;
         throw "$ServerListTable does not contain a valid InsName."
     }
 
-    # Create the destination table if it does not exist. Existing data is preserved.
-    $Step = 'Create the report table'
     $QualifiedTable = '[' + $ReportSchema.Replace(']', ']]') + '].[' + $ReportTable.Replace(']', ']]') + ']'
-    $TableLiteral = $QualifiedTable.Replace("'", "''")
-    $SchemaLiteral = $ReportSchema.Replace("'", "''")
-    $SchemaSql = ('CREATE SCHEMA [' + $ReportSchema.Replace(']', ']]') + '] AUTHORIZATION [dbo];').Replace("'", "''")
-    $SqlQuery = @"
-SET NOCOUNT ON;
-IF SCHEMA_ID(N'$SchemaLiteral') IS NULL
-    EXEC(N'$SchemaSql');
-
-IF OBJECT_ID(N'$TableLiteral', N'U') IS NULL
-BEGIN
-    CREATE TABLE $QualifiedTable
-    (
-        [ReportId] bigint IDENTITY(1,1) NOT NULL CONSTRAINT [PK_SqlUnusedIndexInfo] PRIMARY KEY CLUSTERED,
-        [CollectedAt] datetime2(3) NOT NULL,
-        [SourceInstance] nvarchar(256) NOT NULL,
-        [SqlInstance] nvarchar(256) NULL,
-        [Database] nvarchar(128) NULL,
-        [Schema] nvarchar(128) NULL,
-        [Table] nvarchar(128) NULL,
-        [Index] nvarchar(128) NULL,
-        [IndexId] bigint NULL,
-        [IndexType] nvarchar(128) NULL,
-        [UserSeeks] bigint NULL,
-        [UserScans] bigint NULL,
-        [UserLookups] bigint NULL,
-        [UserUpdates] bigint NULL,
-        [LastUserSeek] datetime2(3) NULL,
-        [LastUserScan] datetime2(3) NULL,
-        [LastUserLookup] datetime2(3) NULL,
-        [LastUserUpdate] datetime2(3) NULL,
-        [IndexSizeMB] decimal(19,2) NULL,
-        [RowCount] bigint NULL,
-        [CompressionDescription] nvarchar(128) NULL
-    );
-    CREATE INDEX [IX_SqlUnusedIndexInfo_CollectedAt]
-        ON $QualifiedTable ([CollectedAt], [SourceInstance]);
-END;
-"@
-    Invoke-DbaQuery -SqlInstance $RepositoryServer -SqlCredential $Credential `
-        -Database $RepositoryDatabase -Query $SqlQuery -QueryTimeout $QueryTimeout -EnableException | Out-Null
 
     $CollectedAt = [datetime]::UtcNow
     $SucceededCount = 0

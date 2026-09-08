@@ -4,10 +4,10 @@ Provisions and validates a service SQL Login on selected local SQL Server
 instances.
 
 .DESCRIPTION
-Uses one shared instance selection supplied by the CLI, or discovers and selects
-local instances when run independently. The script checks whether the current
-Windows account can provision each instance and requests a fallback SQL
-administrator credential only when required.
+Uses one shared instance selection supplied by the Agent setup script, or
+discovers and selects local instances when run independently. The script checks
+whether the current Windows account can provision each instance and requests a
+fallback SQL administrator credential only when required.
 
 The configured service Login is created when missing, its server and msdb
 permissions are applied idempotently, and the supplied service credential is
@@ -69,8 +69,8 @@ selection menu.
 
 .NOTES
 The Monitor repository database, table, and db_owner membership are owned by
-Initialize-SqlMonitorRepository.ps1. Read-only and offline databases are not
-modified by this script.
+ServerRepository setup. This script does not create or replace credential files.
+Read-only and offline databases are not modified by this script.
 #>
 [CmdletBinding()]
 param(

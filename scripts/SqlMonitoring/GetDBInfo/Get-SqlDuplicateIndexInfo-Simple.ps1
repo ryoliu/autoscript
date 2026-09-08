@@ -70,44 +70,7 @@ ORDER BY InsName;
         throw "$ServerListTable does not contain a valid InsName."
     }
 
-    # Create the destination table if it does not exist.
-    $Step = 'Create the report table'
     $QualifiedTable = "[$ReportSchema].[$ReportTable]"
-    $SqlQuery = @"
-SET NOCOUNT ON;
-
-IF OBJECT_ID(N'$QualifiedTable', N'U') IS NULL
-BEGIN
-    CREATE TABLE $QualifiedTable
-    (
-        [ReportId] bigint IDENTITY(1,1) NOT NULL CONSTRAINT [PK_SqlDuplicateIndexInfo] PRIMARY KEY CLUSTERED,
-        [CollectedAt] datetime2(3) NOT NULL,
-        [SourceInstance] nvarchar(256) NOT NULL,
-        [Database] nvarchar(128) NULL,
-        [Table] nvarchar(512) NULL,
-        [Index] nvarchar(128) NULL,
-        [KeyColumns] nvarchar(max) NULL,
-        [IncludedColumns] nvarchar(max) NULL,
-        [IndexType] nvarchar(128) NULL,
-        [IndexSizeMB] decimal(19,2) NULL,
-        [RowCount] bigint NULL,
-        [IsDisabled] bit NULL,
-        [IsUnique] bit NULL,
-        [IsFiltered] bit NULL,
-        [CompressionDescription] nvarchar(128) NULL
-    );
-
-    CREATE INDEX [IX_SqlDuplicateIndexInfo_CollectedAt]
-        ON $QualifiedTable ([CollectedAt], [SourceInstance]);
-END;
-"@
-
-    Invoke-DbaQuery -SqlInstance $RepositoryServer `
-        -SqlCredential $Credential `
-        -Database $RepositoryDatabase `
-        -Query $SqlQuery `
-        -QueryTimeout $QueryTimeout `
-        -EnableException | Out-Null
 
     $CollectedAt = [datetime]::UtcNow
     $SucceededCount = 0

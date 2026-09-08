@@ -3,10 +3,10 @@
 Creates an AES key and an encrypted SQL Login credential file.
 
 .DESCRIPTION
-Prompts for a SQL Login credential, creates a 256-bit AES key, and stores the
-password as an encrypted SecureString. The key and credential files are created
-under the shared Credentials directory by default. The directory is created
-automatically when it does not exist.
+Runs on ServerRepository, prompts for a SQL Login credential, creates a 256-bit
+AES key, and stores the password as an encrypted SecureString. The key and
+credential files are created under the shared Credentials directory by default.
+The directory is created automatically when it does not exist.
 
 File access is restricted to the current Windows account, Local System, and the
 local Administrators group. Both files are required to decrypt the password.
@@ -45,7 +45,9 @@ current password.
 
 .NOTES
 The encrypted credential is only as secure as the AES key file. Keep both files
-protected and do not commit either file to source control.
+protected and do not commit either file to source control. Generate the files
+only on ServerRepository, then manually copy the matching key and XML pair to
+each Agent and grant access only to the Agent runtime account.
 #>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = "Medium")]
 param(

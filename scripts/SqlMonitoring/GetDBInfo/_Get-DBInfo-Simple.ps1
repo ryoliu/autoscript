@@ -24,14 +24,18 @@ Write-Host ''
 Write-Host '4. Disk space information'
 & (Join-Path $PSScriptRoot 'Get-SqlDiskSpace-Simple.ps1')
 
+Write-Host ''
+Write-Host '5. Backup information'
+& (Join-Path $PSScriptRoot 'Get-SqlBackupInfo-Simple.ps1')
+
 if ($IncludeTopResourceUsage) {
     Write-Host ''
-    Write-Host '5. Top resource usage'
+    Write-Host '6. Top resource usage'
     & (Join-Path $PSScriptRoot 'Get-SqlTopResourceUsage-Simple.ps1')
 }
 else {
     Write-Host ''
-    Write-Host '5. Top resource usage skipped.'
+    Write-Host '6. Top resource usage skipped.'
 }
 
 # ===== 3. Finish =====

@@ -4,7 +4,8 @@
 $ConfigPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'Config\repository.config'
 $CredentialDirectory = Join-Path (Split-Path -Parent $PSScriptRoot) 'Credentials'
 $ReportSchema = 'dbo'
-$ReportTable = 'SqlDiskSpace'
+$ReportTable = 'SqlBackupInfo'
+$ExcludedDatabases = @('tempdb')
 $QueryTimeout = 120
 $TrustServerCertificate = $true
 
@@ -43,7 +44,10 @@ try {
     $StoredCredential = Import-Clixml -LiteralPath $CredentialPath
     $SecurePassword = ConvertTo-SecureString `
         -String $StoredCredential.EncryptedPassword -Key $AesKey
-    $Credential = [pscredential]::new($StoredCredential.UserName, $SecurePassword)
+    $Credential = [pscredential]::new(
+        $StoredCredential.UserName,
+        $SecurePassword
+    )
 
     # ===== 4. Get the SQL Server list =====
     $Step = 'Get the SQL Server list'
@@ -69,64 +73,27 @@ ORDER BY InsName;
     }
 
     $QualifiedTable = "[$ReportSchema].[$ReportTable]"
-
     $CollectedAt = [datetime]::UtcNow
     $SucceededCount = 0
     $FailedCount = 0
     $WrittenCount = 0
 
-    # The DMV returns only volumes that contain SQL Server database files.
-    $DiskSpaceQuery = @"
-SET NOCOUNT ON;
-
-SELECT DISTINCT
-    CONVERT(nvarchar(512), [VolumeStats].[volume_mount_point]) AS [Drive],
-    CONVERT
-    (
-        decimal(19, 2),
-        [VolumeStats].[total_bytes] / 1073741824.0
-    ) AS [TotalSizeGB],
-    CONVERT
-    (
-        decimal(19, 2),
-        [VolumeStats].[available_bytes] / 1073741824.0
-    ) AS [FreeSpaceGB],
-    CONVERT
-    (
-        decimal(9, 2),
-        CASE
-            WHEN [VolumeStats].[total_bytes] = 0 THEN NULL
-            ELSE [VolumeStats].[available_bytes] * 100.0 /
-                 [VolumeStats].[total_bytes]
-        END
-    ) AS [FreePercentage]
-FROM sys.master_files AS [MasterFile]
-CROSS APPLY sys.dm_os_volume_stats
-(
-    [MasterFile].[database_id],
-    [MasterFile].[file_id]
-) AS [VolumeStats]
-ORDER BY [Drive];
-"@
-
     # ===== 5. Query each SQL Server =====
     foreach ($Server in $ServerList) {
         $SqlInstance = $Server.InsName
-        $Step = 'Query disk space'
+        $Step = 'Get last backup information'
         Write-Host "Processing: $SqlInstance"
 
         try {
-            $DiskSpaceResult = @(
-                Invoke-DbaQuery -SqlInstance $SqlInstance `
+            $BackupResult = @(
+                Get-DbaLastBackup -SqlInstance $SqlInstance `
                     -SqlCredential $Credential `
-                    -Database 'master' `
-                    -Query $DiskSpaceQuery `
-                    -QueryTimeout $QueryTimeout `
+                    -ExcludeDatabase $ExcludedDatabases `
                     -EnableException
             )
 
-            if ($DiskSpaceResult.Count -eq 0) {
-                Write-Warning "[$SqlInstance] No disk space information was returned."
+            if ($BackupResult.Count -eq 0) {
+                Write-Warning "[$SqlInstance] No backup information was returned."
                 $SucceededCount++
                 continue
             }
@@ -134,14 +101,38 @@ ORDER BY [Drive];
             # ===== 6. Prepare and write the report rows =====
             $Step = 'Prepare report rows'
             $Rows = @(
-                foreach ($Disk in $DiskSpaceResult) {
+                foreach ($Backup in $BackupResult) {
+                    $LastFullBackup = $null
+                    $LastDiffBackup = $null
+                    $LastLogBackup = $null
+
+                    if ($null -ne $Backup.LastFullBackup) {
+                        $LastFullBackup = $Backup.LastFullBackup.Date
+                    }
+
+                    if ($null -ne $Backup.LastDiffBackup) {
+                        $LastDiffBackup = $Backup.LastDiffBackup.Date
+                    }
+
+                    if ($null -ne $Backup.LastLogBackup) {
+                        $LastLogBackup = $Backup.LastLogBackup.Date
+                    }
+
                     [pscustomobject][ordered]@{
-                        CollectedAt    = $CollectedAt
-                        SourceInstance = $SqlInstance
-                        Drive          = $Disk.Drive
-                        TotalSizeGB    = $Disk.TotalSizeGB
-                        FreeSpaceGB    = $Disk.FreeSpaceGB
-                        FreePercentage = $Disk.FreePercentage
+                        CollectedAt                 = $CollectedAt
+                        SourceInstance              = $SqlInstance
+                        SqlInstance                 = $Backup.SqlInstance
+                        Database                    = $Backup.Database
+                        RecoveryModel               = $Backup.RecoveryModel
+                        LastFullBackup              = $LastFullBackup
+                        LastDiffBackup              = $LastDiffBackup
+                        LastLogBackup               = $LastLogBackup
+                        LastFullBackupIsCopyOnly    = $Backup.LastFullBackupIsCopyOnly
+                        LastDiffBackupIsCopyOnly    = $Backup.LastDiffBackupIsCopyOnly
+                        LastLogBackupIsCopyOnly     = $Backup.LastLogBackupIsCopyOnly
+                        DatabaseCreated             = $Backup.DatabaseCreated
+                        DaysSinceDbCreated          = $Backup.DaysSinceDbCreated
+                        Status                      = $Backup.Status
                     }
                 }
             )
@@ -162,7 +153,18 @@ ORDER BY [Drive];
 
             $WrittenCount += $Rows.Count
             $SucceededCount++
-            $Rows | Sort-Object Drive | Format-Table -AutoSize | Out-Host
+            $Rows |
+                Sort-Object Database |
+                Format-Table `
+                    SourceInstance,
+                    Database,
+                    RecoveryModel,
+                    LastFullBackup,
+                    LastDiffBackup,
+                    LastLogBackup,
+                    Status `
+                    -AutoSize |
+                Out-Host
         }
         catch {
             $FailedCount++
@@ -177,7 +179,6 @@ catch {
     throw "Repository=[$RepositoryServer/$RepositoryDatabase]; Step=[$Step]; $($_.Exception.Message). Execution stopped."
 }
 finally {
-    # Release sensitive values and restore the temporary trust setting.
     if ($null -ne $SecurePassword) {
         $SecurePassword.Dispose()
     }

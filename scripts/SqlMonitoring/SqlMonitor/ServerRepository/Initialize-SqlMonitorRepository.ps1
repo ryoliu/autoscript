@@ -3,10 +3,11 @@
 Creates and configures the SQL monitoring repository when required.
 
 .DESCRIPTION
-Reads the repository target from repository.config, connects with Windows
-authentication when possible, and requests a fallback SQL administrator
-credential when required. The database, schema, and table are created only when
-missing. Existing objects are never dropped or rebuilt.
+Runs on ServerRepository, reads the repository target from repository.config,
+connects with Windows authentication when possible, and requests a fallback SQL
+administrator credential when required. The database, schema, and table are
+created only when missing. The six GetDBInfo report tables and their indexes
+are also created in dbo. Existing objects are never dropped or rebuilt.
 
 The configured service SQL Login must already exist on the repository instance. Its database
 user is created or remapped and added to the db_owner database role. The service
@@ -47,11 +48,12 @@ does not have sysadmin or CONTROL SERVER.
 .EXAMPLE
 .\Initialize-SqlMonitorRepository.ps1
 
-Creates missing repository objects and configures the service Login as db_owner.
+Creates the Instance list table, GetDBInfo report tables, and configures the
+service Login as db_owner.
 
 .NOTES
-Run New-SqlServiceLogin.ps1 for the repository instance before this script when
-the configured service SQL Login does not exist.
+Run Start-ServerRepositorySetup.ps1 to provision the repository Login before
+initializing the repository when the configured service SQL Login does not exist.
 #>
 [CmdletBinding()]
 param(
@@ -447,8 +449,8 @@ WHERE [name] = @LoginName;
     if ($null -eq $ServiceLoginResult) {
         throw (
             "SQL Login [$SqlLoginName] does not exist on repository " +
-            "instance [$RepositoryInstance]. Run New-SqlServiceLogin.ps1 " +
-            "for this instance first."
+            "instance [$RepositoryInstance]. Run the ProvisionLogin action in " +
+            "Start-ServerRepositorySetup.ps1 first."
         )
     }
 
@@ -579,6 +581,12 @@ SET XACT_ABORT ON;
 
 DECLARE @SchemaCreated bit = 0;
 DECLARE @TableCreated bit = 0;
+DECLARE @SqlBackupInfoCreated bit = 0;
+DECLARE @SqlDiskSpaceCreated bit = 0;
+DECLARE @SqlDuplicateIndexInfoCreated bit = 0;
+DECLARE @SqlTablePerformanceInfoCreated bit = 0;
+DECLARE @SqlTopResourceUsageCreated bit = 0;
+DECLARE @SqlUnusedIndexInfoCreated bit = 0;
 DECLARE @UserCreated bit = 0;
 DECLARE @DbOwnerAdded bit = 0;
 
@@ -622,6 +630,177 @@ BEGIN
         1;
 END;
 
+IF OBJECT_ID(N'[dbo].[SqlBackupInfo]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[SqlBackupInfo]
+    (
+        [ReportId] bigint IDENTITY(1,1) NOT NULL
+            CONSTRAINT [PK_SqlBackupInfo] PRIMARY KEY CLUSTERED,
+        [CollectedAt] datetime2(3) NOT NULL,
+        [SourceInstance] nvarchar(256) NOT NULL,
+        [SqlInstance] nvarchar(256) NULL,
+        [Database] nvarchar(128) NOT NULL,
+        [RecoveryModel] nvarchar(60) NULL,
+        [LastFullBackup] datetime2(3) NULL,
+        [LastDiffBackup] datetime2(3) NULL,
+        [LastLogBackup] datetime2(3) NULL,
+        [LastFullBackupIsCopyOnly] bit NULL,
+        [LastDiffBackupIsCopyOnly] bit NULL,
+        [LastLogBackupIsCopyOnly] bit NULL,
+        [DatabaseCreated] datetime2(3) NULL,
+        [DaysSinceDbCreated] int NULL,
+        [Status] nvarchar(256) NULL
+    );
+
+    CREATE INDEX [IX_SqlBackupInfo_CollectedAt]
+        ON [dbo].[SqlBackupInfo]
+            ([CollectedAt], [SourceInstance], [Database]);
+
+    SET @SqlBackupInfoCreated = 1;
+END;
+
+IF OBJECT_ID(N'[dbo].[SqlDiskSpace]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[SqlDiskSpace]
+    (
+        [ReportId] bigint IDENTITY(1,1) NOT NULL
+            CONSTRAINT [PK_SqlDiskSpace] PRIMARY KEY CLUSTERED,
+        [CollectedAt] datetime2(3) NOT NULL,
+        [SourceInstance] nvarchar(256) NOT NULL,
+        [Drive] nvarchar(512) NOT NULL,
+        [TotalSizeGB] decimal(19,2) NULL,
+        [FreeSpaceGB] decimal(19,2) NULL,
+        [FreePercentage] decimal(9,2) NULL
+    );
+
+    CREATE INDEX [IX_SqlDiskSpace_CollectedAt]
+        ON [dbo].[SqlDiskSpace] ([CollectedAt], [SourceInstance]);
+
+    SET @SqlDiskSpaceCreated = 1;
+END;
+
+IF OBJECT_ID(N'[dbo].[SqlDuplicateIndexInfo]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[SqlDuplicateIndexInfo]
+    (
+        [ReportId] bigint IDENTITY(1,1) NOT NULL
+            CONSTRAINT [PK_SqlDuplicateIndexInfo] PRIMARY KEY CLUSTERED,
+        [CollectedAt] datetime2(3) NOT NULL,
+        [SourceInstance] nvarchar(256) NOT NULL,
+        [Database] nvarchar(128) NULL,
+        [Table] nvarchar(512) NULL,
+        [Index] nvarchar(128) NULL,
+        [KeyColumns] nvarchar(max) NULL,
+        [IncludedColumns] nvarchar(max) NULL,
+        [IndexType] nvarchar(128) NULL,
+        [IndexSizeMB] decimal(19,2) NULL,
+        [RowCount] bigint NULL,
+        [IsDisabled] bit NULL,
+        [IsUnique] bit NULL,
+        [IsFiltered] bit NULL,
+        [CompressionDescription] nvarchar(128) NULL
+    );
+
+    CREATE INDEX [IX_SqlDuplicateIndexInfo_CollectedAt]
+        ON [dbo].[SqlDuplicateIndexInfo]
+            ([CollectedAt], [SourceInstance]);
+
+    SET @SqlDuplicateIndexInfoCreated = 1;
+END;
+
+IF OBJECT_ID(N'[dbo].[SqlTablePerformanceInfo]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[SqlTablePerformanceInfo]
+    (
+        [ReportId] bigint IDENTITY(1,1) NOT NULL
+            CONSTRAINT [PK_SqlTablePerformanceInfo] PRIMARY KEY CLUSTERED,
+        [CollectedAt] datetime2(3) NOT NULL,
+        [SourceInstance] nvarchar(256) NOT NULL,
+        [SqlInstance] nvarchar(256) NULL,
+        [Database] nvarchar(128) NULL,
+        [Schema] nvarchar(128) NULL,
+        [Name] nvarchar(128) NULL,
+        [RowCount] bigint NULL,
+        [HasClusteredIndex] bit NULL,
+        [DataMB] decimal(19,2) NULL,
+        [IndexMB] decimal(19,2) NULL
+    );
+
+    CREATE INDEX [IX_SqlTablePerformanceInfo_CollectedAt]
+        ON [dbo].[SqlTablePerformanceInfo]
+            ([CollectedAt], [SourceInstance]);
+
+    SET @SqlTablePerformanceInfoCreated = 1;
+END;
+
+IF OBJECT_ID(N'[dbo].[SqlTopResourceUsage]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[SqlTopResourceUsage]
+    (
+        [ReportId] bigint IDENTITY(1,1) NOT NULL
+            CONSTRAINT [PK_SqlTopResourceUsage] PRIMARY KEY CLUSTERED,
+        [CollectedAt] datetime2(3) NOT NULL,
+        [SourceInstance] nvarchar(256) NOT NULL,
+        [Metric] nvarchar(20) NOT NULL,
+        [SqlInstance] nvarchar(256) NULL,
+        [Database] nvarchar(128) NULL,
+        [ObjectName] nvarchar(512) NULL,
+        [QueryHash] nvarchar(130) NULL,
+        [ExecutionCount] bigint NULL,
+        [TotalElapsedTimeMs] decimal(38,4) NULL,
+        [AverageDurationMs] decimal(38,4) NULL,
+        [QueryTotalElapsedTimeMs] decimal(38,4) NULL,
+        [TotalIO] bigint NULL,
+        [AverageIO] decimal(38,4) NULL,
+        [QueryTotalIO] bigint NULL,
+        [CpuTime] bigint NULL,
+        [AverageCpuMs] decimal(38,4) NULL,
+        [QueryTotalCpu] bigint NULL,
+        [QueryText] nvarchar(max) NULL
+    );
+
+    CREATE INDEX [IX_SqlTopResourceUsage_CollectedAt]
+        ON [dbo].[SqlTopResourceUsage]
+            ([CollectedAt], [SourceInstance], [Metric]);
+
+    SET @SqlTopResourceUsageCreated = 1;
+END;
+
+IF OBJECT_ID(N'[dbo].[SqlUnusedIndexInfo]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[SqlUnusedIndexInfo]
+    (
+        [ReportId] bigint IDENTITY(1,1) NOT NULL
+            CONSTRAINT [PK_SqlUnusedIndexInfo] PRIMARY KEY CLUSTERED,
+        [CollectedAt] datetime2(3) NOT NULL,
+        [SourceInstance] nvarchar(256) NOT NULL,
+        [SqlInstance] nvarchar(256) NULL,
+        [Database] nvarchar(128) NULL,
+        [Schema] nvarchar(128) NULL,
+        [Table] nvarchar(128) NULL,
+        [Index] nvarchar(128) NULL,
+        [IndexId] bigint NULL,
+        [IndexType] nvarchar(128) NULL,
+        [UserSeeks] bigint NULL,
+        [UserScans] bigint NULL,
+        [UserLookups] bigint NULL,
+        [UserUpdates] bigint NULL,
+        [LastUserSeek] datetime2(3) NULL,
+        [LastUserScan] datetime2(3) NULL,
+        [LastUserLookup] datetime2(3) NULL,
+        [LastUserUpdate] datetime2(3) NULL,
+        [IndexSizeMB] decimal(19,2) NULL,
+        [RowCount] bigint NULL,
+        [CompressionDescription] nvarchar(128) NULL
+    );
+
+    CREATE INDEX [IX_SqlUnusedIndexInfo_CollectedAt]
+        ON [dbo].[SqlUnusedIndexInfo]
+            ([CollectedAt], [SourceInstance]);
+
+    SET @SqlUnusedIndexInfoCreated = 1;
+END;
+
 IF USER_ID(@LoginName) IS NULL
 BEGIN
     CREATE USER [$SqlLoginName] FOR LOGIN [$SqlLoginName];
@@ -662,6 +841,12 @@ COMMIT TRANSACTION;
 SELECT
     @SchemaCreated AS [SchemaCreated],
     @TableCreated AS [TableCreated],
+    @SqlBackupInfoCreated AS [SqlBackupInfoCreated],
+    @SqlDiskSpaceCreated AS [SqlDiskSpaceCreated],
+    @SqlDuplicateIndexInfoCreated AS [SqlDuplicateIndexInfoCreated],
+    @SqlTablePerformanceInfoCreated AS [SqlTablePerformanceInfoCreated],
+    @SqlTopResourceUsageCreated AS [SqlTopResourceUsageCreated],
+    @SqlUnusedIndexInfoCreated AS [SqlUnusedIndexInfoCreated],
     @UserCreated AS [UserCreated],
     @DbOwnerAdded AS [DbOwnerAdded];
 "@
@@ -693,6 +878,26 @@ SELECT
                             SchemaCreated =
                                 [bool]$Reader["SchemaCreated"]
                             TableCreated = [bool]$Reader["TableCreated"]
+                            SqlBackupInfoCreated =
+                                [bool]$Reader["SqlBackupInfoCreated"]
+                            SqlDiskSpaceCreated =
+                                [bool]$Reader["SqlDiskSpaceCreated"]
+                            SqlDuplicateIndexInfoCreated =
+                                [bool]$Reader[
+                                    "SqlDuplicateIndexInfoCreated"
+                                ]
+                            SqlTablePerformanceInfoCreated =
+                                [bool]$Reader[
+                                    "SqlTablePerformanceInfoCreated"
+                                ]
+                            SqlTopResourceUsageCreated =
+                                [bool]$Reader[
+                                    "SqlTopResourceUsageCreated"
+                                ]
+                            SqlUnusedIndexInfoCreated =
+                                [bool]$Reader[
+                                    "SqlUnusedIndexInfoCreated"
+                                ]
                             UserCreated = [bool]$Reader["UserCreated"]
                             DbOwnerAdded = [bool]$Reader["DbOwnerAdded"]
                         }
@@ -742,6 +947,50 @@ SELECT
     else {
         "Already exists"
     }
+    $SqlBackupInfoStatus = if ($ObjectResult.SqlBackupInfoCreated) {
+        "Created"
+    }
+    else {
+        "Already exists"
+    }
+    $SqlDiskSpaceStatus = if ($ObjectResult.SqlDiskSpaceCreated) {
+        "Created"
+    }
+    else {
+        "Already exists"
+    }
+    $SqlDuplicateIndexInfoStatus = if (
+        $ObjectResult.SqlDuplicateIndexInfoCreated
+    ) {
+        "Created"
+    }
+    else {
+        "Already exists"
+    }
+    $SqlTablePerformanceInfoStatus = if (
+        $ObjectResult.SqlTablePerformanceInfoCreated
+    ) {
+        "Created"
+    }
+    else {
+        "Already exists"
+    }
+    $SqlTopResourceUsageStatus = if (
+        $ObjectResult.SqlTopResourceUsageCreated
+    ) {
+        "Created"
+    }
+    else {
+        "Already exists"
+    }
+    $SqlUnusedIndexInfoStatus = if (
+        $ObjectResult.SqlUnusedIndexInfoCreated
+    ) {
+        "Created"
+    }
+    else {
+        "Already exists"
+    }
     $UserStatus = if ($ObjectResult.UserCreated) {
         "Created"
     }
@@ -768,6 +1017,30 @@ SELECT
         Name = "$RepositorySchema.$RepositoryTable"
         Status = $TableStatus
     }, [pscustomobject]@{
+        Component = "Report table"
+        Name = "dbo.SqlBackupInfo"
+        Status = $SqlBackupInfoStatus
+    }, [pscustomobject]@{
+        Component = "Report table"
+        Name = "dbo.SqlDiskSpace"
+        Status = $SqlDiskSpaceStatus
+    }, [pscustomobject]@{
+        Component = "Report table"
+        Name = "dbo.SqlDuplicateIndexInfo"
+        Status = $SqlDuplicateIndexInfoStatus
+    }, [pscustomobject]@{
+        Component = "Report table"
+        Name = "dbo.SqlTablePerformanceInfo"
+        Status = $SqlTablePerformanceInfoStatus
+    }, [pscustomobject]@{
+        Component = "Report table"
+        Name = "dbo.SqlTopResourceUsage"
+        Status = $SqlTopResourceUsageStatus
+    }, [pscustomobject]@{
+        Component = "Report table"
+        Name = "dbo.SqlUnusedIndexInfo"
+        Status = $SqlUnusedIndexInfoStatus
+    }, [pscustomobject]@{
         Component = "Database user"
         Name = $SqlLoginName
         Status = $UserStatus
@@ -789,6 +1062,7 @@ SELECT
         -Message (
             "Repository initialization completed: " +
             "$RepositoryDatabase.[$RepositorySchema].[$RepositoryTable]; " +
+            "six dbo report tables are ready; " +
             "[$SqlLoginName] is db_owner."
         )
 

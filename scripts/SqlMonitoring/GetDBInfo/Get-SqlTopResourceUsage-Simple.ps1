@@ -71,48 +71,7 @@ ORDER BY InsName;
         throw "$ServerListTable does not contain a valid InsName."
     }
 
-    # Create the destination table if it does not exist.
-    $Step = 'Create the report table'
     $QualifiedTable = "[$ReportSchema].[$ReportTable]"
-    $SqlQuery = @"
-SET NOCOUNT ON;
-
-IF OBJECT_ID(N'$QualifiedTable', N'U') IS NULL
-BEGIN
-    CREATE TABLE $QualifiedTable
-    (
-        [ReportId] bigint IDENTITY(1,1) NOT NULL CONSTRAINT [PK_SqlTopResourceUsage] PRIMARY KEY CLUSTERED,
-        [CollectedAt] datetime2(3) NOT NULL,
-        [SourceInstance] nvarchar(256) NOT NULL,
-        [Metric] nvarchar(20) NOT NULL,
-        [SqlInstance] nvarchar(256) NULL,
-        [Database] nvarchar(128) NULL,
-        [ObjectName] nvarchar(512) NULL,
-        [QueryHash] nvarchar(130) NULL,
-        [ExecutionCount] bigint NULL,
-        [TotalElapsedTimeMs] decimal(38,4) NULL,
-        [AverageDurationMs] decimal(38,4) NULL,
-        [QueryTotalElapsedTimeMs] decimal(38,4) NULL,
-        [TotalIO] bigint NULL,
-        [AverageIO] decimal(38,4) NULL,
-        [QueryTotalIO] bigint NULL,
-        [CpuTime] bigint NULL,
-        [AverageCpuMs] decimal(38,4) NULL,
-        [QueryTotalCpu] bigint NULL,
-        [QueryText] nvarchar(max) NULL
-    );
-
-    CREATE INDEX [IX_SqlTopResourceUsage_CollectedAt]
-        ON $QualifiedTable ([CollectedAt], [SourceInstance], [Metric]);
-END;
-"@
-
-    Invoke-DbaQuery -SqlInstance $RepositoryServer `
-        -SqlCredential $Credential `
-        -Database $RepositoryDatabase `
-        -Query $SqlQuery `
-        -QueryTimeout $QueryTimeout `
-        -EnableException | Out-Null
 
     $CollectedAt = [datetime]::UtcNow
     $SucceededCount = 0

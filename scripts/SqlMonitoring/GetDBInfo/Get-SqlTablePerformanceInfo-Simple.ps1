@@ -72,40 +72,7 @@ ORDER BY InsName;
         throw "$ServerListTable does not contain a valid InsName."
     }
 
-    # Create the destination table if it does not exist.
-    $Step = 'Create the report table'
     $QualifiedTable = "[$ReportSchema].[$ReportTable]"
-    $SqlQuery = @"
-SET NOCOUNT ON;
-
-IF OBJECT_ID(N'$QualifiedTable', N'U') IS NULL
-BEGIN
-    CREATE TABLE $QualifiedTable
-    (
-        [ReportId] bigint IDENTITY(1,1) NOT NULL CONSTRAINT [PK_SqlTablePerformanceInfo] PRIMARY KEY CLUSTERED,
-        [CollectedAt] datetime2(3) NOT NULL,
-        [SourceInstance] nvarchar(256) NOT NULL,
-        [SqlInstance] nvarchar(256) NULL,
-        [Database] nvarchar(128) NULL,
-        [Schema] nvarchar(128) NULL,
-        [Name] nvarchar(128) NULL,
-        [RowCount] bigint NULL,
-        [HasClusteredIndex] bit NULL,
-        [DataMB] decimal(19,2) NULL,
-        [IndexMB] decimal(19,2) NULL
-    );
-
-    CREATE INDEX [IX_SqlTablePerformanceInfo_CollectedAt]
-        ON $QualifiedTable ([CollectedAt], [SourceInstance]);
-END;
-"@
-
-    Invoke-DbaQuery -SqlInstance $RepositoryServer `
-        -SqlCredential $Credential `
-        -Database $RepositoryDatabase `
-        -Query $SqlQuery `
-        -QueryTimeout $QueryTimeout `
-        -EnableException | Out-Null
 
     $CollectedAt = [datetime]::UtcNow
     $SucceededCount = 0

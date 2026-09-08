@@ -1,0 +1,4 @@
+interface:
+  display_name: "SQL Monitoring PowerShell"
+  short_description: "Write clear, maintainable DBA PowerShell for SQL monitoring."
+  default_prompt: "Use $sql-monitoring-powershell to create or revise PowerShell under scripts/SqlMonitoring."

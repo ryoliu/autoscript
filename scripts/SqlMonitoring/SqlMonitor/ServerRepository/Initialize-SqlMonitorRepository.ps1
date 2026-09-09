@@ -7,7 +7,9 @@ Runs on ServerRepository, reads the repository target from repository.config,
 connects with Windows authentication when possible, and requests a fallback SQL
 administrator credential when required. The database, schema, and table are
 created only when missing. The six GetDBInfo report tables and their indexes
-are also created in dbo. Existing objects are never dropped or rebuilt.
+are also created in dbo. The table row-count forecast procedure is created or
+updated, and the GetDBInfo SQL Agent Job is created when missing. Existing
+tables are never dropped or rebuilt.
 
 The configured service SQL Login must already exist on the repository instance. Its database
 user is created or remapped and added to the db_owner database role. The service
@@ -48,8 +50,8 @@ does not have sysadmin or CONTROL SERVER.
 .EXAMPLE
 .\Initialize-SqlMonitorRepository.ps1
 
-Creates the Instance list table, GetDBInfo report tables, and configures the
-service Login as db_owner.
+Creates the Instance list table, GetDBInfo report tables, forecast procedure,
+SQL Agent Job, and configures the service Login as db_owner.
 
 .NOTES
 Run Start-ServerRepositorySetup.ps1 to provision the repository Login before
@@ -915,6 +917,346 @@ SELECT
             }
         }
 
+    $ForecastProcedureExisted = Invoke-SqlWithRetry `
+        -Step "EnsureTableRowCountForecastProcedure" `
+        -Instance $RepositoryInstance `
+        -RetryCount $RetryCount `
+        -RetryDelaySeconds $RetryDelaySeconds `
+        -LogContext $LogContext `
+        -Operation {
+            $Connection = New-RepositoryAdministratorConnection `
+                -InitialCatalog $RepositoryDatabase `
+                -ApplicationName "Initialize Row Count Forecast Procedure"
+
+            try {
+                $Connection.Open()
+                $ProcedureExistsCommand = $Connection.CreateCommand()
+
+                try {
+                    $ProcedureExistsCommand.CommandTimeout =
+                        $CommandTimeoutSeconds
+                    $ProcedureExistsCommand.CommandText = @"
+SELECT CASE
+           WHEN OBJECT_ID(
+               N'[dbo].[usp_GetTableRowCountForecast]',
+               N'P'
+           ) IS NULL THEN 0
+           ELSE 1
+       END;
+"@
+                    $ProcedureExisted =
+                        [bool]$ProcedureExistsCommand.ExecuteScalar()
+                }
+                finally {
+                    $ProcedureExistsCommand.Dispose()
+                }
+
+                $ProcedureCommand = $Connection.CreateCommand()
+
+                try {
+                    $ProcedureCommand.CommandTimeout = $CommandTimeoutSeconds
+                    $ProcedureCommand.CommandText = @"
+CREATE OR ALTER PROCEDURE dbo.usp_GetTableRowCountForecast
+    @LookbackDays     int = 90,
+    @ForecastDays     int = 30,
+    @MinimumSamples   int = 14,
+    @SourceInstance   nvarchar(256) = NULL,
+    @DatabaseName     nvarchar(128) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF @LookbackDays < 7
+        THROW 50001, 'LookbackDays cannot be less than 7.', 1;
+
+    IF @ForecastDays < 1
+        THROW 50002, 'ForecastDays cannot be less than 1.', 1;
+
+    DECLARE
+        @Today date = CONVERT(date, SYSUTCDATETIME()),
+        @StartDate date,
+        @ForecastDate date;
+
+    SET @StartDate = DATEADD(day, 1 - @LookbackDays, @Today);
+    SET @ForecastDate = DATEADD(day, @ForecastDays, @Today);
+
+    ;WITH LatestSamplePerDay AS
+    (
+        SELECT
+            SourceInstance,
+            SqlInstance,
+            [Database],
+            [Schema],
+            [Name],
+            CONVERT(date, CollectedAt) AS SampleDate,
+            [RowCount],
+            ROW_NUMBER() OVER
+            (
+                PARTITION BY
+                    SourceInstance,
+                    SqlInstance,
+                    [Database],
+                    [Schema],
+                    [Name],
+                    CONVERT(date, CollectedAt)
+                ORDER BY
+                    CollectedAt DESC,
+                    ReportId DESC
+            ) AS DailyRowNumber
+        FROM dbo.SqlTablePerformanceInfo
+        WHERE CollectedAt >= @StartDate
+          AND [RowCount] IS NOT NULL
+          AND
+          (
+              @SourceInstance IS NULL
+              OR SourceInstance = @SourceInstance
+          )
+          AND
+          (
+              @DatabaseName IS NULL
+              OR [Database] = @DatabaseName
+          )
+    ),
+    DailySamples AS
+    (
+        SELECT
+            SourceInstance,
+            SqlInstance,
+            [Database],
+            [Schema],
+            [Name],
+            SampleDate,
+            [RowCount],
+            CONVERT(float, DATEDIFF(day, @StartDate, SampleDate)) AS X,
+            CONVERT(float, [RowCount]) AS Y
+        FROM LatestSamplePerDay
+        WHERE DailyRowNumber = 1
+    ),
+    RankedSamples AS
+    (
+        SELECT
+            *,
+            ROW_NUMBER() OVER
+            (
+                PARTITION BY
+                    SourceInstance,
+                    SqlInstance,
+                    [Database],
+                    [Schema],
+                    [Name]
+                ORDER BY SampleDate DESC
+            ) AS LatestRowNumber
+        FROM DailySamples
+    ),
+    RegressionTotals AS
+    (
+        SELECT
+            SourceInstance,
+            SqlInstance,
+            [Database],
+            [Schema],
+            [Name],
+            COUNT(*) AS SampleCount,
+            MIN(SampleDate) AS FirstSampleDate,
+            MAX(SampleDate) AS LastSampleDate,
+            MAX
+            (
+                CASE
+                    WHEN LatestRowNumber = 1 THEN [RowCount]
+                END
+            ) AS CurrentRowCount,
+            SUM(X) AS SumX,
+            SUM(Y) AS SumY,
+            SUM(X * Y) AS SumXY,
+            SUM(X * X) AS SumXX,
+            SUM(Y * Y) AS SumYY
+        FROM RankedSamples
+        GROUP BY
+            SourceInstance,
+            SqlInstance,
+            [Database],
+            [Schema],
+            [Name]
+        HAVING COUNT(*) >= @MinimumSamples
+    ),
+    FormulaParts AS
+    (
+        SELECT
+            *,
+            SampleCount * SumXY - SumX * SumY
+                AS CovarianceNumerator,
+            SampleCount * SumXX - SumX * SumX
+                AS VarianceX,
+            SampleCount * SumYY - SumY * SumY
+                AS VarianceY
+        FROM RegressionTotals
+    ),
+    RegressionSlope AS
+    (
+        SELECT
+            *,
+            CovarianceNumerator / NULLIF(VarianceX, 0.0)
+                AS DailyGrowth
+        FROM FormulaParts
+        WHERE VarianceX <> 0
+    ),
+    RegressionModel AS
+    (
+        SELECT
+            *,
+            (SumY - DailyGrowth * SumX) / SampleCount
+                AS InterceptValue
+        FROM RegressionSlope
+    )
+    SELECT
+        SourceInstance,
+        SqlInstance,
+        [Database],
+        [Schema],
+        [Name],
+        SampleCount,
+        FirstSampleDate,
+        LastSampleDate,
+        CurrentRowCount,
+        CONVERT(decimal(19, 2), DailyGrowth)
+            AS AverageDailyGrowth,
+        @ForecastDate AS ForecastDate,
+        TRY_CONVERT
+        (
+            bigint,
+            ROUND
+            (
+                CASE
+                    WHEN Prediction.PredictedRowCount < 0 THEN 0
+                    ELSE Prediction.PredictedRowCount
+                END,
+                0
+            )
+        ) AS PredictedRowCount,
+        CONVERT
+        (
+            decimal(9, 4),
+            POWER(CovarianceNumerator, 2) /
+            NULLIF(VarianceX * VarianceY, 0.0)
+        ) AS RSquared
+    FROM RegressionModel
+    CROSS APPLY
+    (
+        VALUES
+        (
+            InterceptValue
+            + DailyGrowth
+            * DATEDIFF(day, @StartDate, @ForecastDate)
+        )
+    ) AS Prediction(PredictedRowCount)
+    -- Exclude tables that have not received recent samples.
+    WHERE LastSampleDate >= DATEADD(day, -2, @Today)
+    ORDER BY
+        DailyGrowth DESC,
+        SourceInstance,
+        [Database],
+        [Schema],
+        [Name];
+END;
+"@
+                    [void]$ProcedureCommand.ExecuteNonQuery()
+                }
+                finally {
+                    $ProcedureCommand.Dispose()
+                }
+
+                $ProcedureExisted
+            }
+            finally {
+                $Connection.Dispose()
+            }
+        }
+
+    $AgentJobWasCreated = Invoke-SqlWithRetry `
+        -Step "EnsureGetDBInfoAgentJob" `
+        -Instance $RepositoryInstance `
+        -RetryCount $RetryCount `
+        -RetryDelaySeconds $RetryDelaySeconds `
+        -LogContext $LogContext `
+        -Operation {
+            $Connection = New-RepositoryAdministratorConnection `
+                -InitialCatalog "msdb" `
+                -ApplicationName "Initialize GetDBInfo SQL Agent Job"
+
+            try {
+                $Connection.Open()
+                $Command = $Connection.CreateCommand()
+
+                try {
+                    $Command.CommandTimeout = $CommandTimeoutSeconds
+                    $Command.CommandText = @"
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+
+DECLARE @JobId uniqueidentifier;
+DECLARE @JobCreated bit = 0;
+
+SELECT @JobId = [job_id]
+FROM dbo.sysjobs
+WHERE [name] = N'DBA - Collect Database Information';
+
+IF @JobId IS NULL
+BEGIN
+    BEGIN TRANSACTION;
+
+    BEGIN TRY
+        EXEC dbo.sp_add_job
+            @job_name = N'DBA - Collect Database Information',
+            @enabled = 1,
+            @description = N'Collects local and remote SQL Server instance information from InsList.',
+            @job_id = @JobId OUTPUT;
+
+        EXEC dbo.sp_add_jobstep
+            @job_id = @JobId,
+            @step_name = N'Run GetDBInfo Collector',
+            @subsystem = N'CmdExec',
+            @command = N'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "E:\Scripts\SqlMonitoring\GetDBInfo\_Get-DBInfo-Simple.ps1"',
+            @retry_attempts = 2,
+            @retry_interval = 5,
+            @on_success_action = 1,
+            @on_fail_action = 2;
+
+        EXEC dbo.sp_add_jobschedule
+            @job_id = @JobId,
+            @name = N'Daily 01:00 - GetDBInfo',
+            @enabled = 1,
+            @freq_type = 4,
+            @freq_interval = 1,
+            @active_start_time = 10000;
+
+        EXEC dbo.sp_add_jobserver
+            @job_id = @JobId,
+            @server_name = N'(LOCAL)';
+
+        COMMIT TRANSACTION;
+        SET @JobCreated = 1;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0
+            ROLLBACK TRANSACTION;
+
+        THROW;
+    END CATCH;
+END;
+
+SELECT @JobCreated;
+"@
+                    [bool]$Command.ExecuteScalar()
+                }
+                finally {
+                    $Command.Dispose()
+                }
+            }
+            finally {
+                $Connection.Dispose()
+            }
+        }
+
     [void](
         Test-SqlMonitorRepository `
             -RepositoryInstance $RepositoryInstance `
@@ -991,6 +1333,18 @@ SELECT
     else {
         "Already exists"
     }
+    $ForecastProcedureStatus = if ($ForecastProcedureExisted) {
+        "Updated"
+    }
+    else {
+        "Created"
+    }
+    $AgentJobStatus = if ($AgentJobWasCreated) {
+        "Created"
+    }
+    else {
+        "Already exists"
+    }
     $UserStatus = if ($ObjectResult.UserCreated) {
         "Created"
     }
@@ -1041,6 +1395,14 @@ SELECT
         Name = "dbo.SqlUnusedIndexInfo"
         Status = $SqlUnusedIndexInfoStatus
     }, [pscustomobject]@{
+        Component = "Stored procedure"
+        Name = "dbo.usp_GetTableRowCountForecast"
+        Status = $ForecastProcedureStatus
+    }, [pscustomobject]@{
+        Component = "SQL Agent Job"
+        Name = "DBA - Collect Database Information"
+        Status = $AgentJobStatus
+    }, [pscustomobject]@{
         Component = "Database user"
         Name = $SqlLoginName
         Status = $UserStatus
@@ -1063,6 +1425,8 @@ SELECT
             "Repository initialization completed: " +
             "$RepositoryDatabase.[$RepositorySchema].[$RepositoryTable]; " +
             "six dbo report tables are ready; " +
+            "the row-count forecast procedure is ready; " +
+            "the GetDBInfo SQL Agent Job is ready; " +
             "[$SqlLoginName] is db_owner."
         )
 

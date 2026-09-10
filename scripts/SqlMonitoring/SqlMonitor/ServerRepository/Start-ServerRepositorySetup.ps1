@@ -3,10 +3,9 @@
 Runs setup tasks assigned to the SQL monitoring ServerRepository host.
 
 .DESCRIPTION
-Provisions the service Login on the repository instance, initializes repository
-objects, and creates the AES key and encrypted credential XML. Credential files
-are generated only by this ServerRepository workflow and are manually copied to
-Agent hosts as a matching pair.
+Provisions the repository service Login on the repository instance,
+initializes repository objects and the Collector Job, and creates the AES key
+and encrypted credential XML used only by ServerRepository.
 
 .PARAMETER Action
 ServerRepository action to run. Menu displays the interactive menu. The default
@@ -26,6 +25,27 @@ cannot provision the Login or initialize the repository.
 .PARAMETER ForceCredential
 Replaces the existing matching key and credential XML pair.
 
+.PARAMETER CredentialAccessAccount
+Windows accounts that receive read access to the generated credential files.
+The default is NT SERVICE\SQLSERVERAGENT. Specify the actual service account
+when SQL Server Agent uses a different identity.
+
+.PARAMETER CollectorScriptPath
+Absolute path to the GetDBInfo controller script used by the SQL Agent Job.
+
+.PARAMETER EnableCollectorJob
+Enables the Collector Job. New Jobs are disabled unless this switch is used.
+
+.PARAMETER DisableCollectorJob
+Disables an existing Collector Job.
+
+.PARAMETER IncludeTopResourceUsage
+Runs the optional top resource usage Collector from the SQL Agent Job.
+
+.PARAMETER MonitorRepositoryInstance
+Also grants Client monitoring permissions on the Repository SQL Server itself.
+Use this only when the Repository instance is registered for collection.
+
 .EXAMPLE
 .\Start-ServerRepositorySetup.ps1 -Action RunAll
 
@@ -40,9 +60,9 @@ credential files on ServerRepository.
 Replaces the matching AES key and encrypted credential XML pair.
 
 .NOTES
-Do not run the credential generation step on Agent hosts. After generation,
-manually copy both files together and restrict access to the Agent runtime
-account. Never combine files from different generations.
+Do not run the credential generation step on Client Agent hosts. Keep both
+credential files on ServerRepository and restrict access to the SQL Agent
+runtime account and required administrators.
 #>
 [CmdletBinding()]
 param(
@@ -71,19 +91,33 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$CredentialDirectory = (
-        Join-Path `
-            (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) `
-            "Credentials"
+    [string[]]$CredentialAccessAccount = @(
+        "NT SERVICE\SQLSERVERAGENT"
     ),
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$ConfigPath = (
-        Join-Path `
-            (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) `
-            "Config\repository.config"
-    ),
+    [string]$CollectorScriptPath,
+
+    [Parameter()]
+    [switch]$EnableCollectorJob,
+
+    [Parameter()]
+    [switch]$DisableCollectorJob,
+
+    [Parameter()]
+    [switch]$IncludeTopResourceUsage,
+
+    [Parameter()]
+    [switch]$MonitorRepositoryInstance,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$CredentialDirectory,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$ConfigPath,
 
     [Parameter()]
     [Alias("Ins")]
@@ -120,7 +154,9 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$LogDirectory = (Join-Path $PSScriptRoot "Logs")
+    [string]$LogDirectory = (
+        Join-Path (Split-Path -Parent $PSScriptRoot) "Logs"
+    )
 )
 
 Set-StrictMode -Version Latest
@@ -129,9 +165,20 @@ $ErrorActionPreference = "Stop"
 $CommonModulePath = Join-Path `
     (Split-Path -Parent $PSScriptRoot) `
     "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
-$ProvisionLoginScript = Join-Path `
+$PackagedProvisionLoginScript = Join-Path `
+    $PSScriptRoot `
+    "New-SqlServiceLogin.ps1"
+$SourceProvisionLoginScript = Join-Path `
     (Split-Path -Parent $PSScriptRoot) `
     "Agent\New-SqlServiceLogin.ps1"
+$ProvisionLoginScript = if (
+    Test-Path -LiteralPath $PackagedProvisionLoginScript -PathType Leaf
+) {
+    $PackagedProvisionLoginScript
+}
+else {
+    $SourceProvisionLoginScript
+}
 $InitializeRepositoryScript =
     Join-Path $PSScriptRoot "Initialize-SqlMonitorRepository.ps1"
 $CreateCredentialScript = Join-Path $PSScriptRoot "New-SqlCredentialKey.ps1"
@@ -148,6 +195,35 @@ foreach ($RequiredPath in @(
 }
 
 Import-Module $CommonModulePath -Force
+
+$ServerRoot = Split-Path -Parent $PSScriptRoot
+$SourceRoot = Split-Path -Parent $ServerRoot
+
+if (-not $PSBoundParameters.ContainsKey("ConfigPath")) {
+    $ConfigPath = @(
+        (Join-Path $ServerRoot "Config\repository.config"),
+        (Join-Path $SourceRoot "Config\repository.config")
+    ) |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
+
+    if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+        throw "Repository configuration file was not found."
+    }
+}
+
+if (-not $PSBoundParameters.ContainsKey("CredentialDirectory")) {
+    $CredentialDirectory = @(
+        (Join-Path $ServerRoot "Credentials"),
+        (Join-Path $SourceRoot "Credentials")
+    ) |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Container } |
+        Select-Object -First 1
+
+    if ([string]::IsNullOrWhiteSpace($CredentialDirectory)) {
+        $CredentialDirectory = Join-Path $ServerRoot "Credentials"
+    }
+}
 
 $RepositoryConfigParameters = @{ LiteralPath = $ConfigPath }
 
@@ -231,10 +307,16 @@ function Invoke-ServerRepositoryProvisionLogin {
     param()
 
     $Credential = Get-ServerRepositoryServiceCredential
+    $PermissionProfile = if ($MonitorRepositoryInstance) {
+        "ClientMonitor"
+    }
+    else {
+        "RepositoryWriter"
+    }
     $Parameters = @{
         SourceInstance           = @($RepositoryInstance)
-        ConfigPath               = $ConfigPath
         ServiceLoginName         = $SqlLoginName
+        PermissionProfile        = $PermissionProfile
         ServiceCredential        = $Credential
         ConnectionTimeoutSeconds = $ConnectionTimeoutSeconds
         CommandTimeoutSeconds    = $CommandTimeoutSeconds
@@ -272,6 +354,22 @@ function Invoke-ServerRepositoryInitialization {
         LogContext               = $LogContext
     }
 
+    if (-not [string]::IsNullOrWhiteSpace($CollectorScriptPath)) {
+        $Parameters.CollectorScriptPath = $CollectorScriptPath
+    }
+
+    if ($EnableCollectorJob) {
+        $Parameters.EnableCollectorJob = $true
+    }
+
+    if ($DisableCollectorJob) {
+        $Parameters.DisableCollectorJob = $true
+    }
+
+    if ($IncludeTopResourceUsage) {
+        $Parameters.IncludeTopResourceUsage = $true
+    }
+
     if ($null -ne $SqlAdminCredential) {
         $Parameters.SqlAdminCredential = $SqlAdminCredential
     }
@@ -297,6 +395,13 @@ function Invoke-ServerRepositoryCredentialCreation {
 
     if ($ForceCredential) {
         $Parameters.Force = $true
+    }
+
+    if (
+        $null -ne $CredentialAccessAccount -and
+        $CredentialAccessAccount.Count -gt 0
+    ) {
+        $Parameters.CredentialAccessAccount = $CredentialAccessAccount
     }
 
     [void](& $CreateCredentialScript @Parameters)

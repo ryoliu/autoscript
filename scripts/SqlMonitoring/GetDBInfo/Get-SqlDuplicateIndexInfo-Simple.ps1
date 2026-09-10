@@ -1,5 +1,11 @@
 ﻿#Requires -Version 5.1
 
+[CmdletBinding()]
+param(
+    [Parameter()]
+    [string[]]$SourceInstance
+)
+
 # ===== 1. Settings: Normally, only edit this section =====
 $ConfigPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'Config\repository.config'
 $CredentialDirectory = Join-Path (Split-Path -Parent $PSScriptRoot) 'Credentials'
@@ -57,22 +63,33 @@ WHERE InsName IS NOT NULL
 ORDER BY InsName;
 "@
 
-    $ServerList = @(
-        Invoke-DbaQuery -SqlInstance $RepositoryServer `
-            -SqlCredential $Credential `
-            -Database $RepositoryDatabase `
-            -Query $SqlQuery `
-            -QueryTimeout $QueryTimeout `
-            -EnableException
-    )
+    $ServerList = if ($PSBoundParameters.ContainsKey('SourceInstance')) {
+        @(
+            $SourceInstance |
+                ForEach-Object { $_.Trim() } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Sort-Object -Unique |
+                ForEach-Object { [pscustomobject]@{ InsName = $_ } }
+        )
+    }
+    else {
+        @(
+            Invoke-DbaQuery -SqlInstance $RepositoryServer `
+                -SqlCredential $Credential `
+                -Database $RepositoryDatabase `
+                -Query $SqlQuery `
+                -QueryTimeout $QueryTimeout `
+                -EnableException
+        )
+    }
 
     if ($ServerList.Count -eq 0) {
-        throw "$ServerListTable does not contain a valid InsName."
+        throw 'No valid SourceInstance was provided or registered.'
     }
 
     $QualifiedTable = "[$ReportSchema].[$ReportTable]"
 
-    $CollectedAt = [datetime]::UtcNow
+    $CollectedAt = [datetime]::Now
     $SucceededCount = 0
     $FailedCount = 0
     $WrittenCount = 0

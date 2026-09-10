@@ -26,10 +26,16 @@ discovery and the interactive instance menu.
 
 .PARAMETER ServiceLoginName
 Optional SQL Login name to provision and validate. It overrides SqlLoginName in
-repository.config.
+agent.config.
 
 .PARAMETER ConfigPath
-Path to repository.config, which supplies the default SqlLoginName.
+Path to agent.config, which supplies the default SqlLoginName.
+
+.PARAMETER PermissionProfile
+Both profiles create the required msdb User and grant backup read permissions.
+ClientMonitor also grants server-scoped read-only monitoring permissions.
+RepositoryWriter does not change existing Client monitoring permissions. The
+repository initializer applies its required database permissions separately.
 
 .PARAMETER ServiceCredential
 Credential used to create and validate the service Login. When omitted, the
@@ -68,7 +74,7 @@ Uses the supplied instance list and credential without displaying an instance
 selection menu.
 
 .NOTES
-The Monitor repository database, table, and db_owner membership are owned by
+The Monitor repository database, tables, and writer permissions are owned by
 ServerRepository setup. This script does not create or replace credential files.
 Read-only and offline databases are not modified by this script.
 #>
@@ -80,14 +86,16 @@ param(
     [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$ConfigPath = (
-        Join-Path `
-            (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) `
-            "Config\repository.config"
+        Join-Path $PSScriptRoot "Config\agent.config"
     ),
 
     [Parameter()]
     [ValidatePattern('^[A-Za-z0-9._-]+$')]
     [string]$ServiceLoginName,
+
+    [Parameter()]
+    [ValidateSet("ClientMonitor", "RepositoryWriter")]
+    [string]$PermissionProfile = "ClientMonitor",
 
     [Parameter()]
     [PSCredential]$ServiceCredential,
@@ -122,9 +130,20 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$CommonModulePath = Join-Path `
+$PackagedModulePath = Join-Path `
+    $PSScriptRoot `
+    "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
+$SourceModulePath = Join-Path `
     (Split-Path -Parent $PSScriptRoot) `
     "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
+$CommonModulePath = if (
+    Test-Path -LiteralPath $PackagedModulePath -PathType Leaf
+) {
+    $PackagedModulePath
+}
+else {
+    $SourceModulePath
+}
 
 if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
     throw "Required module not found: $CommonModulePath"
@@ -132,10 +151,9 @@ if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
 
 Import-Module $CommonModulePath -Force
 
-$RepositoryConfig = Get-SqlRepositoryConfig -LiteralPath $ConfigPath
-
 if (-not $PSBoundParameters.ContainsKey("ServiceLoginName")) {
-    $ServiceLoginName = $RepositoryConfig.SqlLoginName
+    $AgentConfig = Get-SqlAgentConfig -LiteralPath $ConfigPath
+    $ServiceLoginName = $AgentConfig.SqlLoginName
 }
 
 if ($null -eq $LogContext) {
@@ -320,7 +338,6 @@ SELECT
                 "required."
             )
             $SqlAdminCredential = Get-Credential `
-                -UserName "zabbix" `
                 -Message (
                     "Enter a SQL Login that can create logins and grant " +
                     "permissions"
@@ -515,17 +532,21 @@ WITH
                                 $CommandTimeoutSeconds
                             $GrantCommand.CommandText = @"
 GRANT CONNECT SQL TO [$ServiceLoginName];
+DECLARE @ConfiguredDatabaseCount int = 0;
+DECLARE @ProductMajorVersion int =
+    CONVERT(int, SERVERPROPERTY(N'ProductMajorVersion'));
+
+IF N'$PermissionProfile' = N'ClientMonitor'
+BEGIN
 GRANT CONNECT ANY DATABASE TO [$ServiceLoginName];
 GRANT VIEW ANY DATABASE TO [$ServiceLoginName];
 GRANT VIEW ANY DEFINITION TO [$ServiceLoginName];
 GRANT VIEW SERVER STATE TO [$ServiceLoginName];
 
-DECLARE @ProductMajorVersion int =
-    CONVERT(int, SERVERPROPERTY(N'ProductMajorVersion'));
-
 IF @ProductMajorVersion >= 16
 BEGIN
     EXEC(N'GRANT VIEW SERVER PERFORMANCE STATE TO [$ServiceLoginName];');
+END;
 END;
 
 USE [msdb];
@@ -539,73 +560,10 @@ BEGIN
     ALTER USER [$ServiceLoginName] WITH LOGIN = [$ServiceLoginName];
 END;
 
-IF NOT EXISTS
-(
-    SELECT 1
-    FROM sys.database_role_members AS drm
-    INNER JOIN sys.database_principals AS role_principal
-        ON role_principal.principal_id = drm.role_principal_id
-    INNER JOIN sys.database_principals AS member_principal
-        ON member_principal.principal_id = drm.member_principal_id
-    WHERE role_principal.name = N'SQLAgentOperatorRole'
-      AND member_principal.name = N'$ServiceLoginName'
-)
-BEGIN
-    ALTER ROLE [SQLAgentOperatorRole]
-        ADD MEMBER [$ServiceLoginName];
-END;
-
+GRANT CONNECT TO [$ServiceLoginName];
+GRANT SELECT TO [$ServiceLoginName];
 GRANT EXECUTE ON OBJECT::dbo.agent_datetime
     TO [$ServiceLoginName];
-
-DECLARE @DatabaseName sysname;
-DECLARE @DatabaseSql nvarchar(max);
-DECLARE @ConfiguredDatabaseCount int = 0;
-
-DECLARE UserDatabaseCursor CURSOR LOCAL FAST_FORWARD FOR
-SELECT [name]
-FROM sys.databases
-WHERE [database_id] > 4
-  AND [state_desc] = N'ONLINE'
-  AND [is_read_only] = 0
-  AND [source_database_id] IS NULL
-ORDER BY [name];
-
-OPEN UserDatabaseCursor;
-
-FETCH NEXT FROM UserDatabaseCursor INTO @DatabaseName;
-
-WHILE @@FETCH_STATUS = 0
-BEGIN
-    SET @DatabaseSql =
-        N'USE ' + QUOTENAME(@DatabaseName) + N';
-IF USER_ID(N''$ServiceLoginName'') IS NULL
-BEGIN
-    CREATE USER [$ServiceLoginName] FOR LOGIN [$ServiceLoginName];
-END
-ELSE
-BEGIN
-    ALTER USER [$ServiceLoginName] WITH LOGIN = [$ServiceLoginName];
-END;
-
-GRANT CONNECT TO [$ServiceLoginName];
-GRANT VIEW DEFINITION TO [$ServiceLoginName];
-GRANT VIEW DATABASE STATE TO [$ServiceLoginName];';
-
-    IF @ProductMajorVersion >= 16
-    BEGIN
-        SET @DatabaseSql +=
-            N' GRANT VIEW DATABASE PERFORMANCE STATE TO [$ServiceLoginName];';
-    END;
-
-    EXEC sys.sp_executesql @DatabaseSql;
-    SET @ConfiguredDatabaseCount += 1;
-
-    FETCH NEXT FROM UserDatabaseCursor INTO @DatabaseName;
-END;
-
-CLOSE UserDatabaseCursor;
-DEALLOCATE UserDatabaseCursor;
 
 SELECT @ConfiguredDatabaseCount;
 "@
@@ -657,7 +615,22 @@ SELECT @ConfiguredDatabaseCount;
 SELECT
     CONVERT(nvarchar(128), ORIGINAL_LOGIN()) AS [LoginName],
     CONVERT(nvarchar(128), SERVERPROPERTY(N'ServerName'))
-        AS [ServerName];
+        AS [ServerName],
+    CONVERT(bit, ISNULL(IS_SRVROLEMEMBER(N'sysadmin'), 0))
+        AS [IsSysAdmin],
+    (
+        SELECT COUNT_BIG(*)
+        FROM sys.server_role_members AS role_membership
+        INNER JOIN sys.server_principals AS member_principal
+            ON member_principal.[principal_id] =
+                role_membership.[member_principal_id]
+        WHERE member_principal.[name] = ORIGINAL_LOGIN()
+    ) AS [ServerRoleCount],
+    CONVERT
+    (
+        bit,
+        ISNULL(HAS_PERMS_BY_NAME(NULL, NULL, N'CONTROL SERVER'), 0)
+    ) AS [HasControlServer];
 "@
                             $Reader = $Command.ExecuteReader()
 
@@ -668,6 +641,12 @@ SELECT
                                         [string]$Reader["LoginName"]
                                     ServerName =
                                         [string]$Reader["ServerName"]
+                                    IsSysAdmin =
+                                        [bool]$Reader["IsSysAdmin"]
+                                    ServerRoleCount =
+                                        [long]$Reader["ServerRoleCount"]
+                                    HasControlServer =
+                                        [bool]$Reader["HasControlServer"]
                                 }
                             }
                             finally {
@@ -688,6 +667,17 @@ SELECT
                     "Credential authenticated as " +
                     "[$($ValidationResult.LoginName)], expected " +
                     "[$ServiceLoginName]."
+                )
+            }
+
+            if (
+                $ValidationResult.IsSysAdmin -or
+                $ValidationResult.ServerRoleCount -gt 0 -or
+                $ValidationResult.HasControlServer
+            ) {
+                throw (
+                    "Service Login [$ServiceLoginName] must not have " +
+                    "server role membership, sysadmin, or CONTROL SERVER."
                 )
             }
 

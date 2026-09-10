@@ -150,6 +150,91 @@ function Get-SqlRepositoryConfig {
     }
 }
 
+function Get-SqlAgentConfig {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$LiteralPath
+    )
+
+    if (-not (Test-Path -LiteralPath $LiteralPath -PathType Leaf)) {
+        throw "Agent configuration file not found: $LiteralPath"
+    }
+
+    $FileValues = @{}
+    $LineNumber = 0
+
+    foreach (
+        $ConfigLine in Get-Content `
+            -LiteralPath $LiteralPath `
+            -Encoding UTF8
+    ) {
+        $LineNumber++
+        $TrimmedLine = $ConfigLine.Trim()
+
+        if (
+            [string]::IsNullOrWhiteSpace($TrimmedLine) -or
+            $TrimmedLine.StartsWith("#")
+        ) {
+            continue
+        }
+
+        $SeparatorIndex = $TrimmedLine.IndexOf("=")
+
+        if ($SeparatorIndex -lt 1) {
+            throw (
+                "Invalid agent configuration at [$LiteralPath] line " +
+                "$LineNumber. Expected Key=Value."
+            )
+        }
+
+        $Key = $TrimmedLine.Substring(0, $SeparatorIndex).Trim()
+        $Value = $TrimmedLine.Substring($SeparatorIndex + 1).Trim()
+
+        if ($Key -ne "SqlLoginName") {
+            throw (
+                "Unknown agent configuration key [$Key] at " +
+                "[$LiteralPath] line $LineNumber."
+            )
+        }
+
+        if ($FileValues.ContainsKey($Key)) {
+            throw (
+                "Duplicate agent configuration key [$Key] at " +
+                "[$LiteralPath] line $LineNumber."
+            )
+        }
+
+        if ([string]::IsNullOrWhiteSpace($Value)) {
+            throw (
+                "Agent configuration key [$Key] has no value at " +
+                "[$LiteralPath] line $LineNumber."
+            )
+        }
+
+        $FileValues[$Key] = $Value
+    }
+
+    if (-not $FileValues.ContainsKey("SqlLoginName")) {
+        throw (
+            "Required agent configuration key [SqlLoginName] not found " +
+            "in [$LiteralPath]."
+        )
+    }
+
+    if ($FileValues.SqlLoginName -notmatch '^[A-Za-z0-9._-]+$') {
+        throw (
+            "Invalid SQL Login name [$($FileValues.SqlLoginName)] for " +
+            "agent configuration key [SqlLoginName] in [$LiteralPath]."
+        )
+    }
+
+    [pscustomobject]@{
+        SqlLoginName = [string]$FileValues.SqlLoginName
+    }
+}
+
 function New-SqlMaintenanceLogContext {
     [CmdletBinding()]
     param(
@@ -821,7 +906,28 @@ SELECT
         HAS_PERMS_BY_NAME(@QualifiedTable, N'OBJECT', N'INSERT'),
         0
     ) AS [CanInsert],
+    ISNULL(
+        HAS_PERMS_BY_NAME(@QualifiedTable, N'OBJECT', N'UPDATE'),
+        0
+    ) AS [CanUpdate],
     ISNULL(IS_ROLEMEMBER(N'db_owner'), 0) AS [IsDbOwner],
+    ISNULL(
+        HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'CONTROL'),
+        0
+    ) AS [HasControlDatabase],
+    (
+        SELECT COUNT_BIG(*)
+        FROM sys.database_role_members AS role_membership
+        INNER JOIN sys.database_principals AS member_principal
+            ON member_principal.[principal_id] =
+                role_membership.[member_principal_id]
+        WHERE member_principal.[name] = USER_NAME()
+    ) AS [DatabaseRoleCount],
+    ISNULL(IS_SRVROLEMEMBER(N'sysadmin'), 0) AS [IsSysAdmin],
+    ISNULL(
+        HAS_PERMS_BY_NAME(NULL, NULL, N'CONTROL SERVER'),
+        0
+    ) AS [HasControlServer],
     TYPE_NAME([system_type_id]) AS [DataType],
     CASE
         WHEN TYPE_NAME([system_type_id]) IN (N'nchar', N'nvarchar')
@@ -854,8 +960,17 @@ WHERE [object_id] = @ObjectId
                                 TableObjectId = [int]$Reader["TableObjectId"]
                                 CanSelect = [int]$Reader["CanSelect"] -eq 1
                                 CanInsert = [int]$Reader["CanInsert"] -eq 1
+                                CanUpdate = [int]$Reader["CanUpdate"] -eq 1
                                 IsDbOwner =
                                     [int]$Reader["IsDbOwner"] -eq 1
+                                HasControlDatabase =
+                                    [int]$Reader["HasControlDatabase"] -eq 1
+                                DatabaseRoleCount =
+                                    [long]$Reader["DatabaseRoleCount"]
+                                IsSysAdmin =
+                                    [int]$Reader["IsSysAdmin"] -eq 1
+                                HasControlServer =
+                                    [int]$Reader["HasControlServer"] -eq 1
                                 DataType = [string]$Reader["DataType"]
                                 CharacterLength =
                                     [int]$Reader["CharacterLength"]
@@ -883,25 +998,37 @@ WHERE [object_id] = @ObjectId
 
         if (
             $ObjectResult.CharacterLength -ne -1 -and
-            $ObjectResult.CharacterLength -lt 50
+            $ObjectResult.CharacterLength -lt 256
         ) {
             throw (
-                "Repository column InsName must hold at least 50 " +
+                "Repository column InsName must hold at least 256 " +
                 "characters; found $($ObjectResult.CharacterLength)."
             )
         }
 
-        if (-not $ObjectResult.IsDbOwner) {
+        if (
+            -not $ObjectResult.CanSelect -or
+            -not $ObjectResult.CanInsert -or
+            -not $ObjectResult.CanUpdate
+        ) {
             throw (
-                "SQL Login [$($Credential.UserName)] must be a member of " +
-                "db_owner in repository database [$RepositoryDatabase]."
+                "SQL Login [$($Credential.UserName)] requires SELECT, " +
+                "INSERT, and UPDATE on " +
+                "$RepositoryDatabase.$QualifiedTable."
             )
         }
 
-        if (-not $ObjectResult.CanSelect -or -not $ObjectResult.CanInsert) {
+        if (
+            -not $ObjectResult.IsDbOwner -or
+            $ObjectResult.DatabaseRoleCount -ne 1 -or
+            $ObjectResult.IsSysAdmin -or
+            $ObjectResult.HasControlServer
+        ) {
             throw (
-                "SQL Login [$($Credential.UserName)] requires SELECT and " +
-                "INSERT on $RepositoryDatabase.$QualifiedTable."
+                "SQL Login [$($Credential.UserName)] must be a member of " +
+                "only db_owner in repository database " +
+                "[$RepositoryDatabase] and must not have sysadmin or " +
+                "CONTROL SERVER permissions."
             )
         }
 
@@ -914,7 +1041,8 @@ WHERE [object_id] = @ObjectId
                 "Repository is ready: " +
                 "$RepositoryDatabase.$QualifiedTable; " +
                 "InsName=$($ObjectResult.DataType)" +
-                "($($ObjectResult.CharacterLength)); db_owner=True."
+                "($($ObjectResult.CharacterLength)); " +
+                "SELECT=True; INSERT=True; UPDATE=True."
             )
 
         [pscustomobject]@{
@@ -924,7 +1052,12 @@ WHERE [object_id] = @ObjectId
             DatabaseState       = $DatabaseResult.State
             CanSelect           = $ObjectResult.CanSelect
             CanInsert           = $ObjectResult.CanInsert
+            CanUpdate           = $ObjectResult.CanUpdate
             IsDbOwner           = $ObjectResult.IsDbOwner
+            HasControlDatabase  = $ObjectResult.HasControlDatabase
+            DatabaseRoleCount   = $ObjectResult.DatabaseRoleCount
+            IsSysAdmin          = $ObjectResult.IsSysAdmin
+            HasControlServer    = $ObjectResult.HasControlServer
             InsNameDataType     = $ObjectResult.DataType
             InsNameLength       = $ObjectResult.CharacterLength
             IsReady             = $true
@@ -937,6 +1070,7 @@ WHERE [object_id] = @ObjectId
 
 Export-ModuleMember -Function @(
     "Get-SqlRepositoryConfig",
+    "Get-SqlAgentConfig",
     "Get-LocalSqlInstance",
     "Select-SqlInstance",
     "New-SqlConnection",

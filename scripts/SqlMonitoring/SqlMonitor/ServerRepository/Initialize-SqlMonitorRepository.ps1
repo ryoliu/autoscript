@@ -7,13 +7,13 @@ Runs on ServerRepository, reads the repository target from repository.config,
 connects with Windows authentication when possible, and requests a fallback SQL
 administrator credential when required. The database, schema, and table are
 created only when missing. The six GetDBInfo report tables and their indexes
-are also created in dbo. The table row-count forecast procedure is created or
-updated, and the GetDBInfo SQL Agent Job is created when missing. Existing
-tables are never dropped or rebuilt.
+are also created in dbo. The table row-count forecast procedure and GetDBInfo
+SQL Agent Job are created or updated. Existing report tables are never dropped
+or rebuilt.
 
-The configured service SQL Login must already exist on the repository instance. Its database
-user is created or remapped and added to the db_owner database role. The service
-credential is used for a final repository validation.
+The configured service SQL Login must already exist on the repository instance.
+Its database user is created or remapped and added to the db_owner database
+role.
 
 .PARAMETER ConfigPath
 Path to the repository configuration file. The default is repository.config in
@@ -36,7 +36,7 @@ Optional table name that overrides RepositoryTable in the repository
 configuration file.
 
 .PARAMETER SqlLoginName
-Optional SQL Login mapped to the repository database and added to db_owner. It
+Optional SQL Login mapped to the repository database as a db_owner member. It
 overrides SqlLoginName in repository.config.
 
 .PARAMETER ServiceCredential
@@ -47,11 +47,24 @@ prompts for it.
 Optional fallback SQL administrator credential used when Windows authentication
 does not have sysadmin or CONTROL SERVER.
 
+.PARAMETER CollectorScriptPath
+Absolute path to the GetDBInfo controller script used by the SQL Agent Job.
+
+.PARAMETER EnableCollectorJob
+Enables the SQL Agent Job. New Jobs are disabled unless this switch is used.
+
+.PARAMETER DisableCollectorJob
+Disables an existing SQL Agent Job. It cannot be combined with
+EnableCollectorJob.
+
+.PARAMETER IncludeTopResourceUsage
+Adds IncludeTopResourceUsage to the SQL Agent Job command.
+
 .EXAMPLE
 .\Initialize-SqlMonitorRepository.ps1
 
 Creates the Instance list table, GetDBInfo report tables, forecast procedure,
-SQL Agent Job, and configures the service Login as db_owner.
+SQL Agent Job, and service Login db_owner membership.
 
 .NOTES
 Run Start-ServerRepositorySetup.ps1 to provision the repository Login before
@@ -61,11 +74,7 @@ initializing the repository when the configured service SQL Login does not exist
 param(
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$ConfigPath = (
-        Join-Path `
-            (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) `
-            "Config\repository.config"
-    ),
+    [string]$ConfigPath,
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
@@ -94,6 +103,19 @@ param(
     [PSCredential]$SqlAdminCredential,
 
     [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$CollectorScriptPath,
+
+    [Parameter()]
+    [switch]$EnableCollectorJob,
+
+    [Parameter()]
+    [switch]$DisableCollectorJob,
+
+    [Parameter()]
+    [switch]$IncludeTopResourceUsage,
+
+    [Parameter()]
     [ValidateRange(1, 300)]
     [int]$ConnectionTimeoutSeconds = 15,
 
@@ -111,7 +133,9 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$LogDirectory = (Join-Path $PSScriptRoot "Logs"),
+    [string]$LogDirectory = (
+        Join-Path (Split-Path -Parent $PSScriptRoot) "Logs"
+    ),
 
     [Parameter()]
     [psobject]$LogContext
@@ -129,6 +153,21 @@ if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
 }
 
 Import-Module $CommonModulePath -Force
+
+if (-not $PSBoundParameters.ContainsKey("ConfigPath")) {
+    $ServerRoot = Split-Path -Parent $PSScriptRoot
+    $SourceRoot = Split-Path -Parent $ServerRoot
+    $ConfigPath = @(
+        (Join-Path $ServerRoot "Config\repository.config"),
+        (Join-Path $SourceRoot "Config\repository.config")
+    ) |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
+
+    if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+        throw "Repository configuration file was not found."
+    }
+}
 
 $RepositoryConfigParameters = @{
     LiteralPath = $ConfigPath
@@ -194,6 +233,61 @@ if ($ServiceCredential.UserName -cne $SqlLoginName) {
         "Credential user [$($ServiceCredential.UserName)] does not match " +
         "SqlLoginName [$SqlLoginName]."
     )
+}
+
+if ($EnableCollectorJob -and $DisableCollectorJob) {
+    throw (
+        "EnableCollectorJob and DisableCollectorJob cannot be used " +
+        "together."
+    )
+}
+
+if (-not $PSBoundParameters.ContainsKey("CollectorScriptPath")) {
+    $ServerRoot = Split-Path -Parent $PSScriptRoot
+    $SourceRoot = Split-Path -Parent $ServerRoot
+    $CollectorScriptCandidates = @(
+        (Join-Path $ServerRoot "GetDBInfo\_Get-DBInfo-Simple.ps1"),
+        (Join-Path $SourceRoot "GetDBInfo\_Get-DBInfo-Simple.ps1")
+    )
+    $CollectorScriptPath = $CollectorScriptCandidates |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
+}
+
+if (
+    [string]::IsNullOrWhiteSpace($CollectorScriptPath) -or
+    -not (Test-Path -LiteralPath $CollectorScriptPath -PathType Leaf)
+) {
+    throw "GetDBInfo Collector script not found: $CollectorScriptPath"
+}
+
+$CollectorScriptPath = (Resolve-Path -LiteralPath $CollectorScriptPath).Path
+
+if ([System.IO.Path]::GetExtension($CollectorScriptPath) -ine ".ps1") {
+    throw "CollectorScriptPath must reference a .ps1 file."
+}
+
+if ($CollectorScriptPath.Contains('"')) {
+    throw "CollectorScriptPath cannot contain a double quote."
+}
+
+$CollectorCommand =
+    'powershell.exe -NoProfile -NonInteractive -File "{0}"' -f `
+        $CollectorScriptPath
+
+if ($IncludeTopResourceUsage) {
+    $CollectorCommand += " -IncludeTopResourceUsage"
+}
+
+$NewCollectorJobEnabled = [int]$EnableCollectorJob.IsPresent
+$UpdateCollectorJobEnabled = if ($EnableCollectorJob) {
+    1
+}
+elseif ($DisableCollectorJob) {
+    0
+}
+else {
+    $null
 }
 
 $CurrentWindowsAccount =
@@ -349,7 +443,6 @@ try {
 
         if ($null -eq $SqlAdminCredential) {
             $SqlAdminCredential = Get-Credential `
-                -UserName "zabbix" `
                 -Message (
                     "Enter a SQL Login with sysadmin or CONTROL SERVER on " +
                     "the repository instance"
@@ -590,6 +683,8 @@ DECLARE @SqlTablePerformanceInfoCreated bit = 0;
 DECLARE @SqlTopResourceUsageCreated bit = 0;
 DECLARE @SqlUnusedIndexInfoCreated bit = 0;
 DECLARE @UserCreated bit = 0;
+DECLARE @InstanceTableAltered bit = 0;
+DECLARE @ReportedInstanceNameAdded bit = 0;
 DECLARE @DbOwnerAdded bit = 0;
 
 BEGIN TRANSACTION;
@@ -604,9 +699,55 @@ IF OBJECT_ID(@QualifiedTable, N'U') IS NULL
 BEGIN
     CREATE TABLE [$RepositorySchema].[$RepositoryTable]
     (
-        [InsName] varchar(50) NOT NULL
+        [InsName] nvarchar(256) NOT NULL,
+        [ReportedInstanceName] nvarchar(128) NULL
     );
     SET @TableCreated = 1;
+END;
+
+IF EXISTS
+(
+    SELECT 1
+    FROM sys.columns
+    WHERE [object_id] = OBJECT_ID(@QualifiedTable, N'U')
+      AND [name] = N'InsName'
+      AND
+      (
+          TYPE_NAME([system_type_id]) <> N'nvarchar'
+          OR [max_length] <> 512
+          OR [is_nullable] <> 0
+      )
+)
+BEGIN
+    ALTER TABLE [$RepositorySchema].[$RepositoryTable]
+        ALTER COLUMN [InsName] nvarchar(256) NOT NULL;
+    SET @InstanceTableAltered = 1;
+END;
+
+IF COL_LENGTH(@QualifiedTable, N'ReportedInstanceName') IS NULL
+BEGIN
+    ALTER TABLE [$RepositorySchema].[$RepositoryTable]
+        ADD [ReportedInstanceName] nvarchar(128) NULL;
+    SET @ReportedInstanceNameAdded = 1;
+END;
+
+IF EXISTS
+(
+    SELECT 1
+    FROM sys.columns
+    WHERE [object_id] = OBJECT_ID(@QualifiedTable, N'U')
+      AND [name] = N'ReportedInstanceName'
+      AND
+      (
+          TYPE_NAME([system_type_id]) <> N'nvarchar'
+          OR [max_length] <> 256
+          OR [is_nullable] <> 1
+      )
+)
+BEGIN
+    ALTER TABLE [$RepositorySchema].[$RepositoryTable]
+        ALTER COLUMN [ReportedInstanceName] nvarchar(128) NULL;
+    SET @InstanceTableAltered = 1;
 END;
 
 IF NOT EXISTS
@@ -615,21 +756,71 @@ IF NOT EXISTS
     FROM sys.columns
     WHERE [object_id] = OBJECT_ID(@QualifiedTable, N'U')
       AND [name] = N'InsName'
-      AND TYPE_NAME([system_type_id]) IN (N'varchar', N'nvarchar')
-      AND
-      (
-          [max_length] = -1
-          OR CASE
-                 WHEN TYPE_NAME([system_type_id]) = N'nvarchar'
-                     THEN [max_length] / 2
-                 ELSE [max_length]
-             END >= 50
-      )
+      AND TYPE_NAME([system_type_id]) = N'nvarchar'
+      AND [max_length] = 512
+      AND [is_nullable] = 0
 )
 BEGIN
     THROW 50001,
         N'Repository table InsName column is missing or incompatible.',
         1;
+END;
+
+IF NOT EXISTS
+(
+    SELECT 1
+    FROM sys.indexes AS index_info
+    INNER JOIN sys.index_columns AS index_column
+        ON index_column.[object_id] = index_info.[object_id]
+       AND index_column.[index_id] = index_info.[index_id]
+    INNER JOIN sys.columns AS column_info
+        ON column_info.[object_id] = index_column.[object_id]
+       AND column_info.[column_id] = index_column.[column_id]
+    WHERE index_info.[object_id] = OBJECT_ID(@QualifiedTable, N'U')
+      AND index_info.[is_unique] = 1
+      AND index_info.[has_filter] = 0
+      AND index_info.[is_disabled] = 0
+      AND index_column.[key_ordinal] = 1
+      AND column_info.[name] = N'InsName'
+      AND NOT EXISTS
+      (
+          SELECT 1
+          FROM sys.index_columns AS additional_column
+          WHERE additional_column.[object_id] = index_info.[object_id]
+            AND additional_column.[index_id] = index_info.[index_id]
+            AND additional_column.[key_ordinal] > 1
+      )
+)
+BEGIN
+    IF EXISTS
+    (
+        SELECT 1
+        FROM sys.indexes
+        WHERE [object_id] = OBJECT_ID(@QualifiedTable, N'U')
+          AND [name] = N'UX_SqlMonitor_InsName'
+    )
+    BEGIN
+        THROW 50004,
+            N'Index UX_SqlMonitor_InsName does not enforce unique InsName.',
+            1;
+    END;
+
+    IF EXISTS
+    (
+        SELECT [InsName]
+        FROM [$RepositorySchema].[$RepositoryTable]
+        GROUP BY [InsName]
+        HAVING COUNT_BIG(*) > 1
+    )
+    BEGIN
+        THROW 50005,
+            N'Duplicate InsName values must be resolved before initialization.',
+            1;
+    END;
+
+    CREATE UNIQUE NONCLUSTERED INDEX [UX_SqlMonitor_InsName]
+        ON [$RepositorySchema].[$RepositoryTable] ([InsName]);
+    SET @InstanceTableAltered = 1;
 END;
 
 IF OBJECT_ID(N'[dbo].[SqlBackupInfo]', N'U') IS NULL
@@ -814,13 +1005,6 @@ BEGIN
 END;
 
 GRANT CONNECT TO [$SqlLoginName];
-GRANT VIEW DEFINITION TO [$SqlLoginName];
-GRANT VIEW DATABASE STATE TO [$SqlLoginName];
-
-IF CONVERT(int, SERVERPROPERTY(N'ProductMajorVersion')) >= 16
-BEGIN
-    EXEC(N'GRANT VIEW DATABASE PERFORMANCE STATE TO [$SqlLoginName];');
-END;
 
 IF NOT EXISTS
 (
@@ -850,6 +1034,8 @@ SELECT
     @SqlTopResourceUsageCreated AS [SqlTopResourceUsageCreated],
     @SqlUnusedIndexInfoCreated AS [SqlUnusedIndexInfoCreated],
     @UserCreated AS [UserCreated],
+    @InstanceTableAltered AS [InstanceTableAltered],
+    @ReportedInstanceNameAdded AS [ReportedInstanceNameAdded],
     @DbOwnerAdded AS [DbOwnerAdded];
 "@
                     [void]$Command.Parameters.Add(
@@ -901,7 +1087,12 @@ SELECT
                                     "SqlUnusedIndexInfoCreated"
                                 ]
                             UserCreated = [bool]$Reader["UserCreated"]
-                            DbOwnerAdded = [bool]$Reader["DbOwnerAdded"]
+                            InstanceTableAltered =
+                                [bool]$Reader["InstanceTableAltered"]
+                            ReportedInstanceNameAdded =
+                                [bool]$Reader["ReportedInstanceNameAdded"]
+                            DbOwnerAdded =
+                                [bool]$Reader["DbOwnerAdded"]
                         }
                     }
                     finally {
@@ -973,7 +1164,7 @@ BEGIN
         THROW 50002, 'ForecastDays cannot be less than 1.', 1;
 
     DECLARE
-        @Today date = CONVERT(date, SYSUTCDATETIME()),
+        @Today date = CONVERT(date, SYSDATETIME()),
         @StartDate date,
         @ForecastDate date;
 
@@ -1194,33 +1385,92 @@ SET NOCOUNT ON;
 SET XACT_ABORT ON;
 
 DECLARE @JobId uniqueidentifier;
+DECLARE @LegacyJobId uniqueidentifier;
+DECLARE @StepId int;
 DECLARE @JobCreated bit = 0;
 
 SELECT @JobId = [job_id]
 FROM dbo.sysjobs
-WHERE [name] = N'DBA - Collect Database Information';
+WHERE [name] = @JobName;
 
-IF @JobId IS NULL
-BEGIN
-    BEGIN TRANSACTION;
+SELECT @LegacyJobId = [job_id]
+FROM dbo.sysjobs
+WHERE [name] = @LegacyJobName;
 
-    BEGIN TRY
+IF @JobId IS NOT NULL AND @LegacyJobId IS NOT NULL
+    THROW 50003,
+        'Both the current and legacy GetDBInfo SQL Agent Jobs exist.',
+        1;
+
+BEGIN TRANSACTION;
+
+BEGIN TRY
+    IF @JobId IS NULL AND @LegacyJobId IS NOT NULL
+    BEGIN
+        SET @JobId = @LegacyJobId;
+
+        EXEC dbo.sp_update_job
+            @job_id = @JobId,
+            @new_name = @JobName;
+    END;
+
+    IF @JobId IS NULL
+    BEGIN
         EXEC dbo.sp_add_job
-            @job_name = N'DBA - Collect Database Information',
-            @enabled = 1,
+            @job_name = @JobName,
+            @enabled = @NewJobEnabled,
             @description = N'Collects local and remote SQL Server instance information from InsList.',
             @job_id = @JobId OUTPUT;
 
+        SET @JobCreated = 1;
+    END
+    ELSE IF @UpdateJobEnabled IS NOT NULL
+    BEGIN
+        EXEC dbo.sp_update_job
+            @job_id = @JobId,
+            @enabled = @UpdateJobEnabled;
+    END;
+
+    SELECT @StepId = [step_id]
+    FROM dbo.sysjobsteps
+    WHERE [job_id] = @JobId
+      AND [step_name] = N'Run GetDBInfo Collector';
+
+    IF @StepId IS NULL
+    BEGIN
         EXEC dbo.sp_add_jobstep
             @job_id = @JobId,
             @step_name = N'Run GetDBInfo Collector',
             @subsystem = N'CmdExec',
-            @command = N'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "E:\Scripts\SqlMonitoring\GetDBInfo\_Get-DBInfo-Simple.ps1"',
+            @command = @CollectorCommand,
             @retry_attempts = 2,
             @retry_interval = 5,
             @on_success_action = 1,
             @on_fail_action = 2;
+    END
+    ELSE
+    BEGIN
+        EXEC dbo.sp_update_jobstep
+            @job_id = @JobId,
+            @step_id = @StepId,
+            @subsystem = N'CmdExec',
+            @command = @CollectorCommand,
+            @retry_attempts = 2,
+            @retry_interval = 5,
+            @on_success_action = 1,
+            @on_fail_action = 2;
+    END;
 
+    IF NOT EXISTS
+    (
+        SELECT 1
+        FROM dbo.sysjobschedules AS job_schedule
+        INNER JOIN dbo.sysschedules AS schedule
+            ON schedule.schedule_id = job_schedule.schedule_id
+        WHERE job_schedule.job_id = @JobId
+          AND schedule.[name] = N'Daily 01:00 - GetDBInfo'
+    )
+    BEGIN
         EXEC dbo.sp_add_jobschedule
             @job_id = @JobId,
             @name = N'Daily 01:00 - GetDBInfo',
@@ -1228,24 +1478,70 @@ BEGIN
             @freq_type = 4,
             @freq_interval = 1,
             @active_start_time = 10000;
+    END;
 
+    IF NOT EXISTS
+    (
+        SELECT 1
+        FROM dbo.sysjobservers
+        WHERE [job_id] = @JobId
+    )
+    BEGIN
         EXEC dbo.sp_add_jobserver
             @job_id = @JobId,
             @server_name = N'(LOCAL)';
+    END;
 
-        COMMIT TRANSACTION;
-        SET @JobCreated = 1;
-    END TRY
-    BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
+    COMMIT TRANSACTION;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0
+        ROLLBACK TRANSACTION;
 
-        THROW;
-    END CATCH;
-END;
+    THROW;
+END CATCH;
 
 SELECT @JobCreated;
 "@
+                    [void]$Command.Parameters.Add(
+                        "@JobName",
+                        [System.Data.SqlDbType]::NVarChar,
+                        128
+                    )
+                    [void]$Command.Parameters.Add(
+                        "@LegacyJobName",
+                        [System.Data.SqlDbType]::NVarChar,
+                        128
+                    )
+                    [void]$Command.Parameters.Add(
+                        "@CollectorCommand",
+                        [System.Data.SqlDbType]::NVarChar,
+                        -1
+                    )
+                    [void]$Command.Parameters.Add(
+                        "@NewJobEnabled",
+                        [System.Data.SqlDbType]::Bit
+                    )
+                    [void]$Command.Parameters.Add(
+                        "@UpdateJobEnabled",
+                        [System.Data.SqlDbType]::Bit
+                    )
+                    $Command.Parameters["@JobName"].Value =
+                        "_CollectDatabaseInformation"
+                    $Command.Parameters["@LegacyJobName"].Value =
+                        "DBA - Collect Database Information"
+                    $Command.Parameters["@CollectorCommand"].Value =
+                        $CollectorCommand
+                    $Command.Parameters["@NewJobEnabled"].Value =
+                        $NewCollectorJobEnabled
+                    $Command.Parameters["@UpdateJobEnabled"].Value = if (
+                        $null -eq $UpdateCollectorJobEnabled
+                    ) {
+                        [DBNull]::Value
+                    }
+                    else {
+                        $UpdateCollectorJobEnabled
+                    }
                     [bool]$Command.ExecuteScalar()
                 }
                 finally {
@@ -1285,6 +1581,12 @@ SELECT @JobCreated;
     }
     $TableStatus = if ($ObjectResult.TableCreated) {
         "Created"
+    }
+    elseif (
+        $ObjectResult.InstanceTableAltered -or
+        $ObjectResult.ReportedInstanceNameAdded
+    ) {
+        "Updated"
     }
     else {
         "Already exists"
@@ -1343,7 +1645,7 @@ SELECT @JobCreated;
         "Created"
     }
     else {
-        "Already exists"
+        "Updated"
     }
     $UserStatus = if ($ObjectResult.UserCreated) {
         "Created"
@@ -1351,11 +1653,11 @@ SELECT @JobCreated;
     else {
         "Mapped"
     }
-    $DbOwnerStatus = if ($ObjectResult.DbOwnerAdded) {
-        "Added"
+    $RepositoryPermissionStatus = if ($ObjectResult.DbOwnerAdded) {
+        "db_owner membership granted"
     }
     else {
-        "Already a member"
+        "db_owner membership retained"
     }
 
     $Result = [pscustomobject]@{
@@ -1400,16 +1702,20 @@ SELECT @JobCreated;
         Status = $ForecastProcedureStatus
     }, [pscustomobject]@{
         Component = "SQL Agent Job"
-        Name = "DBA - Collect Database Information"
+        Name = "_CollectDatabaseInformation"
         Status = $AgentJobStatus
+    }, [pscustomobject]@{
+        Component = "Collector script"
+        Name = $CollectorScriptPath
+        Status = "Configured"
     }, [pscustomobject]@{
         Component = "Database user"
         Name = $SqlLoginName
         Status = $UserStatus
     }, [pscustomobject]@{
-        Component = "Database role"
-        Name = "db_owner/$SqlLoginName"
-        Status = $DbOwnerStatus
+        Component = "Database permissions"
+        Name = $SqlLoginName
+        Status = $RepositoryPermissionStatus
     }
 
     Write-Host ""
@@ -1427,7 +1733,7 @@ SELECT @JobCreated;
             "six dbo report tables are ready; " +
             "the row-count forecast procedure is ready; " +
             "the GetDBInfo SQL Agent Job is ready; " +
-            "[$SqlLoginName] is db_owner."
+            "[$SqlLoginName] is a repository db_owner member."
         )
 
     $Result

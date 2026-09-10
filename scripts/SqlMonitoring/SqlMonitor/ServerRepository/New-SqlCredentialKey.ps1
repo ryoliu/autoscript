@@ -8,8 +8,9 @@ AES key, and stores the password as an encrypted SecureString. The key and
 credential files are created under the shared Credentials directory by default.
 The directory is created automatically when it does not exist.
 
-File access is restricted to the current Windows account, Local System, and the
-local Administrators group. Both files are required to decrypt the password.
+Full control is restricted to the current Windows account, Local System, and
+the local Administrators group. The default SQL Server Agent service account
+receives read access. Both files are required to decrypt the password.
 
 .PARAMETER SqlLoginName
 Optional SQL Login name stored in the credential file. It overrides
@@ -21,6 +22,11 @@ Path to repository.config, which supplies the default SqlLoginName.
 .PARAMETER CredentialDirectory
 Directory in which the key and credential files are created. The default is
 the shared Credentials directory.
+
+.PARAMETER CredentialAccessAccount
+Windows accounts that receive read access to the credential files. The default
+is NT SERVICE\SQLSERVERAGENT. Specify the actual service account when SQL Server
+Agent uses a different identity.
 
 .PARAMETER Credential
 Optional credential supplied by the caller. When omitted, Get-Credential opens
@@ -46,8 +52,8 @@ current password.
 .NOTES
 The encrypted credential is only as secure as the AES key file. Keep both files
 protected and do not commit either file to source control. Generate the files
-only on ServerRepository, then manually copy the matching key and XML pair to
-each Agent and grant access only to the Agent runtime account.
+only on ServerRepository and grant access only to the SQL Agent runtime account
+and required administrators.
 #>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = "Medium")]
 param(
@@ -57,18 +63,16 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$ConfigPath = (
-        Join-Path `
-            (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) `
-            "Config\repository.config"
-    ),
+    [string]$ConfigPath,
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$CredentialDirectory = (
-        Join-Path `
-            (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) `
-            "Credentials"
+    [string]$CredentialDirectory,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$CredentialAccessAccount = @(
+        "NT SERVICE\SQLSERVERAGENT"
     ),
 
     [Parameter()]
@@ -79,7 +83,9 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$LogDirectory = (Join-Path $PSScriptRoot "Logs"),
+    [string]$LogDirectory = (
+        Join-Path (Split-Path -Parent $PSScriptRoot) "Logs"
+    ),
 
     [Parameter()]
     [psobject]$LogContext
@@ -97,6 +103,35 @@ if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
 }
 
 Import-Module $CommonModulePath -Force
+
+$ServerRoot = Split-Path -Parent $PSScriptRoot
+$SourceRoot = Split-Path -Parent $ServerRoot
+
+if (-not $PSBoundParameters.ContainsKey("ConfigPath")) {
+    $ConfigPath = @(
+        (Join-Path $ServerRoot "Config\repository.config"),
+        (Join-Path $SourceRoot "Config\repository.config")
+    ) |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
+
+    if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+        throw "Repository configuration file was not found."
+    }
+}
+
+if (-not $PSBoundParameters.ContainsKey("CredentialDirectory")) {
+    $CredentialDirectory = if (
+        Test-Path -LiteralPath (
+            Join-Path $SourceRoot "Config\repository.config"
+        ) -PathType Leaf
+    ) {
+        Join-Path $SourceRoot "Credentials"
+    }
+    else {
+        Join-Path $ServerRoot "Credentials"
+    }
+}
 
 $RepositoryConfig = Get-SqlRepositoryConfig -LiteralPath $ConfigPath
 
@@ -125,19 +160,44 @@ function Set-RestrictedFileAcl {
 
     # Build the ACL from well-known SIDs so the script works on localized
     # versions of Windows.
-    $AllowedSids = @(
+    $FullControlSids = @(
         [Security.Principal.WindowsIdentity]::GetCurrent().User,
         [Security.Principal.SecurityIdentifier]::new("S-1-5-18"),
         [Security.Principal.SecurityIdentifier]::new("S-1-5-32-544")
     )
+    $ReadSids = @()
+
+    foreach ($AccountName in $CredentialAccessAccount) {
+        try {
+            $Account = [Security.Principal.NTAccount]::new($AccountName)
+            $ReadSids += $Account.Translate(
+                [Security.Principal.SecurityIdentifier]
+            )
+        }
+        catch {
+            throw (
+                "Credential access account [$AccountName] could not be " +
+                "resolved: $($_.Exception.Message)"
+            )
+        }
+    }
 
     $Acl = [Security.AccessControl.FileSecurity]::new()
     $Acl.SetAccessRuleProtection($true, $false)
 
-    foreach ($Sid in $AllowedSids) {
+    foreach ($Sid in $FullControlSids) {
         $AccessRule = [Security.AccessControl.FileSystemAccessRule]::new(
             $Sid,
             [Security.AccessControl.FileSystemRights]::FullControl,
+            [Security.AccessControl.AccessControlType]::Allow
+        )
+        [void]$Acl.AddAccessRule($AccessRule)
+    }
+
+    foreach ($Sid in $ReadSids) {
+        $AccessRule = [Security.AccessControl.FileSystemAccessRule]::new(
+            $Sid,
+            [Security.AccessControl.FileSystemRights]::Read,
             [Security.AccessControl.AccessControlType]::Allow
         )
         [void]$Acl.AddAccessRule($AccessRule)

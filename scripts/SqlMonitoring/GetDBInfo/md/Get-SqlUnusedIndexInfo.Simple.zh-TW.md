@@ -23,7 +23,7 @@
 | `CredentialDirectory` | Credential 檔案目錄。 |
 | `Credential` | 直接傳入 SQL Server Credential。 |
 | `Database` | 只收集指定的 Database；未指定時收集所有可用的使用者 Database。 |
-| `CollectedAt` | 資料收集時間，預設為目前 UTC 時間。 |
+| `CollectedAt` | 資料收集時間，預設為 Collector 作業系統的目前本機時間。 |
 | `SharedContext` | 由 Controller 傳入的共用 Context；單獨執行時不需要指定。 |
 
 ## 執行範例

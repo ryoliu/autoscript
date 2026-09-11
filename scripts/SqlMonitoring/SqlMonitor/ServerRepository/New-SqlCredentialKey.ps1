@@ -83,9 +83,7 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$LogDirectory = (
-        Join-Path (Split-Path -Parent $PSScriptRoot) "Logs"
-    ),
+    [string]$LogDirectory,
 
     [Parameter()]
     [psobject]$LogContext
@@ -94,8 +92,29 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$ModuleRootCandidates = @(
+    (Split-Path -Parent $PSScriptRoot),
+    (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
+)
+$ServerRoot = $ModuleRootCandidates |
+    Where-Object {
+        Test-Path `
+            -LiteralPath (
+                Join-Path `
+                    $_ `
+                    "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
+            ) `
+            -PathType Leaf
+    } |
+    Select-Object -First 1
+
+if ([string]::IsNullOrWhiteSpace($ServerRoot)) {
+    throw "Required SqlMaintenance.Common module was not found."
+}
+
+$SourceRoot = Split-Path -Parent $ServerRoot
 $CommonModulePath = Join-Path `
-    (Split-Path -Parent $PSScriptRoot) `
+    $ServerRoot `
     "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
 
 if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
@@ -104,8 +123,9 @@ if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
 
 Import-Module $CommonModulePath -Force
 
-$ServerRoot = Split-Path -Parent $PSScriptRoot
-$SourceRoot = Split-Path -Parent $ServerRoot
+if (-not $PSBoundParameters.ContainsKey("LogDirectory")) {
+    $LogDirectory = Join-Path $ServerRoot "Logs"
+}
 
 if (-not $PSBoundParameters.ContainsKey("ConfigPath")) {
     $ConfigPath = @(

@@ -9,7 +9,8 @@ administrator credential when required. The database, schema, and table are
 created only when missing. The six GetDBInfo report tables and their indexes
 are also created in dbo. The table row-count forecast procedure and GetDBInfo
 SQL Agent Job are created or updated. Existing report tables are never dropped
-or rebuilt.
+or rebuilt. Legacy ReportedInstanceName values in the Instance list are moved
+to InsName before the obsolete column is removed.
 
 The configured service SQL Login must already exist on the repository instance.
 Its database user is created or remapped and added to the db_owner database
@@ -133,9 +134,7 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$LogDirectory = (
-        Join-Path (Split-Path -Parent $PSScriptRoot) "Logs"
-    ),
+    [string]$LogDirectory,
 
     [Parameter()]
     [psobject]$LogContext
@@ -144,8 +143,29 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$ModuleRootCandidates = @(
+    (Split-Path -Parent $PSScriptRoot),
+    (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
+)
+$ServerRoot = $ModuleRootCandidates |
+    Where-Object {
+        Test-Path `
+            -LiteralPath (
+                Join-Path `
+                    $_ `
+                    "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
+            ) `
+            -PathType Leaf
+    } |
+    Select-Object -First 1
+
+if ([string]::IsNullOrWhiteSpace($ServerRoot)) {
+    throw "Required SqlMaintenance.Common module was not found."
+}
+
+$SourceRoot = Split-Path -Parent $ServerRoot
 $CommonModulePath = Join-Path `
-    (Split-Path -Parent $PSScriptRoot) `
+    $ServerRoot `
     "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
 
 if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
@@ -154,9 +174,11 @@ if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
 
 Import-Module $CommonModulePath -Force
 
+if (-not $PSBoundParameters.ContainsKey("LogDirectory")) {
+    $LogDirectory = Join-Path $ServerRoot "Logs"
+}
+
 if (-not $PSBoundParameters.ContainsKey("ConfigPath")) {
-    $ServerRoot = Split-Path -Parent $PSScriptRoot
-    $SourceRoot = Split-Path -Parent $ServerRoot
     $ConfigPath = @(
         (Join-Path $ServerRoot "Config\repository.config"),
         (Join-Path $SourceRoot "Config\repository.config")
@@ -243,8 +265,6 @@ if ($EnableCollectorJob -and $DisableCollectorJob) {
 }
 
 if (-not $PSBoundParameters.ContainsKey("CollectorScriptPath")) {
-    $ServerRoot = Split-Path -Parent $PSScriptRoot
-    $SourceRoot = Split-Path -Parent $ServerRoot
     $CollectorScriptCandidates = @(
         (Join-Path $ServerRoot "GetDBInfo\_Get-DBInfo-Simple.ps1"),
         (Join-Path $SourceRoot "GetDBInfo\_Get-DBInfo-Simple.ps1")
@@ -684,7 +704,6 @@ DECLARE @SqlTopResourceUsageCreated bit = 0;
 DECLARE @SqlUnusedIndexInfoCreated bit = 0;
 DECLARE @UserCreated bit = 0;
 DECLARE @InstanceTableAltered bit = 0;
-DECLARE @ReportedInstanceNameAdded bit = 0;
 DECLARE @DbOwnerAdded bit = 0;
 
 BEGIN TRANSACTION;
@@ -699,8 +718,7 @@ IF OBJECT_ID(@QualifiedTable, N'U') IS NULL
 BEGIN
     CREATE TABLE [$RepositorySchema].[$RepositoryTable]
     (
-        [InsName] nvarchar(256) NOT NULL,
-        [ReportedInstanceName] nvarchar(128) NULL
+        [InsName] nvarchar(256) NOT NULL
     );
     SET @TableCreated = 1;
 END;
@@ -724,29 +742,39 @@ BEGIN
     SET @InstanceTableAltered = 1;
 END;
 
-IF COL_LENGTH(@QualifiedTable, N'ReportedInstanceName') IS NULL
+IF COL_LENGTH(@QualifiedTable, N'ReportedInstanceName') IS NOT NULL
 BEGIN
-    ALTER TABLE [$RepositorySchema].[$RepositoryTable]
-        ADD [ReportedInstanceName] nvarchar(128) NULL;
-    SET @ReportedInstanceNameAdded = 1;
-END;
-
+    EXEC(N'
 IF EXISTS
 (
-    SELECT 1
-    FROM sys.columns
-    WHERE [object_id] = OBJECT_ID(@QualifiedTable, N'U')
-      AND [name] = N'ReportedInstanceName'
-      AND
-      (
-          TYPE_NAME([system_type_id]) <> N'nvarchar'
-          OR [max_length] <> 256
-          OR [is_nullable] <> 1
-      )
+    SELECT
+        COALESCE(
+            NULLIF(LTRIM(RTRIM([ReportedInstanceName])), N''''),
+            [InsName]
+        )
+    FROM [$RepositorySchema].[$RepositoryTable]
+    GROUP BY
+        COALESCE(
+            NULLIF(LTRIM(RTRIM([ReportedInstanceName])), N''''),
+            [InsName]
+        )
+    HAVING COUNT_BIG(*) > 1
 )
 BEGIN
-    ALTER TABLE [$RepositorySchema].[$RepositoryTable]
-        ALTER COLUMN [ReportedInstanceName] nvarchar(128) NULL;
+    THROW 50006,
+        N''ReportedInstanceName migration would create duplicate InsName values.'',
+        1;
+END;
+
+UPDATE [$RepositorySchema].[$RepositoryTable]
+SET [InsName] = COALESCE(
+    NULLIF(LTRIM(RTRIM([ReportedInstanceName])), N''''),
+    [InsName]
+);
+
+ALTER TABLE [$RepositorySchema].[$RepositoryTable]
+    DROP COLUMN [ReportedInstanceName];
+');
     SET @InstanceTableAltered = 1;
 END;
 
@@ -1035,7 +1063,6 @@ SELECT
     @SqlUnusedIndexInfoCreated AS [SqlUnusedIndexInfoCreated],
     @UserCreated AS [UserCreated],
     @InstanceTableAltered AS [InstanceTableAltered],
-    @ReportedInstanceNameAdded AS [ReportedInstanceNameAdded],
     @DbOwnerAdded AS [DbOwnerAdded];
 "@
                     [void]$Command.Parameters.Add(
@@ -1089,8 +1116,6 @@ SELECT
                             UserCreated = [bool]$Reader["UserCreated"]
                             InstanceTableAltered =
                                 [bool]$Reader["InstanceTableAltered"]
-                            ReportedInstanceNameAdded =
-                                [bool]$Reader["ReportedInstanceNameAdded"]
                             DbOwnerAdded =
                                 [bool]$Reader["DbOwnerAdded"]
                         }
@@ -1582,10 +1607,7 @@ SELECT @JobCreated;
     $TableStatus = if ($ObjectResult.TableCreated) {
         "Created"
     }
-    elseif (
-        $ObjectResult.InstanceTableAltered -or
-        $ObjectResult.ReportedInstanceNameAdded
-    ) {
+    elseif ($ObjectResult.InstanceTableAltered) {
         "Updated"
     }
     else {

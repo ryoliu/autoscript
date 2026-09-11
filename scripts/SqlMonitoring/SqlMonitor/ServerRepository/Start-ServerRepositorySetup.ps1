@@ -154,22 +154,45 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$LogDirectory = (
-        Join-Path (Split-Path -Parent $PSScriptRoot) "Logs"
-    )
+    [string]$LogDirectory
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$ServerRoot = @(
+    $PSScriptRoot,
+    (Split-Path -Parent $PSScriptRoot)
+) |
+    Where-Object {
+        Test-Path `
+            -LiteralPath (
+                Join-Path `
+                    $_ `
+                    "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
+            ) `
+            -PathType Leaf
+    } |
+    Select-Object -First 1
+
+if ([string]::IsNullOrWhiteSpace($ServerRoot)) {
+    throw "Unable to locate the SQL monitoring Server root."
+}
+
+$SourceRoot = Split-Path -Parent $ServerRoot
+
+if (-not $PSBoundParameters.ContainsKey("LogDirectory")) {
+    $LogDirectory = Join-Path $ServerRoot "Logs"
+}
+
 $CommonModulePath = Join-Path `
-    (Split-Path -Parent $PSScriptRoot) `
+    $ServerRoot `
     "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
 $PackagedProvisionLoginScript = Join-Path `
-    $PSScriptRoot `
-    "New-SqlServiceLogin.ps1"
+    $ServerRoot `
+    "ServerRepository\Scripts\New-SqlServiceLogin.ps1"
 $SourceProvisionLoginScript = Join-Path `
-    (Split-Path -Parent $PSScriptRoot) `
+    $ServerRoot `
     "Agent\New-SqlServiceLogin.ps1"
 $ProvisionLoginScript = if (
     Test-Path -LiteralPath $PackagedProvisionLoginScript -PathType Leaf
@@ -179,9 +202,36 @@ $ProvisionLoginScript = if (
 else {
     $SourceProvisionLoginScript
 }
-$InitializeRepositoryScript =
-    Join-Path $PSScriptRoot "Initialize-SqlMonitorRepository.ps1"
-$CreateCredentialScript = Join-Path $PSScriptRoot "New-SqlCredentialKey.ps1"
+$PackagedInitializeRepositoryScript = Join-Path `
+    $ServerRoot `
+    "ServerRepository\Scripts\Initialize-SqlMonitorRepository.ps1"
+$SourceInitializeRepositoryScript = Join-Path `
+    $PSScriptRoot `
+    "Initialize-SqlMonitorRepository.ps1"
+$InitializeRepositoryScript = if (
+    Test-Path `
+        -LiteralPath $PackagedInitializeRepositoryScript `
+        -PathType Leaf
+) {
+    $PackagedInitializeRepositoryScript
+}
+else {
+    $SourceInitializeRepositoryScript
+}
+$PackagedCreateCredentialScript = Join-Path `
+    $ServerRoot `
+    "ServerRepository\Scripts\New-SqlCredentialKey.ps1"
+$SourceCreateCredentialScript = Join-Path `
+    $PSScriptRoot `
+    "New-SqlCredentialKey.ps1"
+$CreateCredentialScript = if (
+    Test-Path -LiteralPath $PackagedCreateCredentialScript -PathType Leaf
+) {
+    $PackagedCreateCredentialScript
+}
+else {
+    $SourceCreateCredentialScript
+}
 
 foreach ($RequiredPath in @(
     $CommonModulePath,
@@ -195,9 +245,6 @@ foreach ($RequiredPath in @(
 }
 
 Import-Module $CommonModulePath -Force
-
-$ServerRoot = Split-Path -Parent $PSScriptRoot
-$SourceRoot = Split-Path -Parent $ServerRoot
 
 if (-not $PSBoundParameters.ContainsKey("ConfigPath")) {
     $ConfigPath = @(

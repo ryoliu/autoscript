@@ -4,8 +4,9 @@ Creates separate Client and ServerRepository deployment packages.
 
 .DESCRIPTION
 Copies only the files required by each deployment role. The Client package does
-not include repository configuration, central registration scripts, AES keys,
-credential XML files, or GetDBInfo Collectors.
+include Repository connection settings in agent.config, but does not include
+AES keys, credential XML files, server-side repository.config, or GetDBInfo
+Collectors.
 
 .PARAMETER OutputRoot
 Parent directory where SqlMonitoringClient and SqlMonitoringServer are created.
@@ -85,6 +86,7 @@ foreach ($RequiredSourcePath in $RequiredSourcePaths) {
 
 $ClientDirectories = @(
     $ClientPackageRoot,
+    (Join-Path $ClientPackageRoot "Scripts"),
     (Join-Path $ClientPackageRoot "Config"),
     (Join-Path $ClientPackageRoot "Modules"),
     (Join-Path $ClientPackageRoot "Logs")
@@ -92,6 +94,7 @@ $ClientDirectories = @(
 $ServerDirectories = @(
     $ServerPackageRoot,
     (Join-Path $ServerPackageRoot "ServerRepository"),
+    (Join-Path $ServerPackageRoot "ServerRepository\Scripts"),
     (Join-Path $ServerPackageRoot "GetDBInfo"),
     (Join-Path $ServerPackageRoot "Config"),
     (Join-Path $ServerPackageRoot "Credentials"),
@@ -108,7 +111,12 @@ Copy-Item `
     -Destination $ClientPackageRoot
 Copy-Item `
     -LiteralPath (Join-Path $AgentSource "New-SqlServiceLogin.ps1") `
-    -Destination $ClientPackageRoot
+    -Destination (Join-Path $ClientPackageRoot "Scripts")
+Copy-Item `
+    -LiteralPath (
+        Join-Path $ServerRepositorySource "Register-SqlMonitoringClient.ps1"
+    ) `
+    -Destination (Join-Path $ClientPackageRoot "Scripts")
 Copy-Item `
     -LiteralPath (Join-Path $AgentSource "Config\agent.config") `
     -Destination (Join-Path $ClientPackageRoot "Config")
@@ -117,24 +125,30 @@ Copy-Item `
     -Destination (Join-Path $ClientPackageRoot "Modules") `
     -Recurse
 
+Copy-Item `
+    -LiteralPath (
+        Join-Path $ServerRepositorySource "Start-ServerRepositorySetup.ps1"
+    ) `
+    -Destination $ServerPackageRoot
+
 foreach ($ServerRepositoryScript in @(
-    "Start-ServerRepositorySetup.ps1",
     "Initialize-SqlMonitorRepository.ps1",
-    "New-SqlCredentialKey.ps1",
-    "Register-SqlMonitoringClient.ps1"
+    "New-SqlCredentialKey.ps1"
 )) {
     Copy-Item `
         -LiteralPath (
             Join-Path $ServerRepositorySource $ServerRepositoryScript
         ) `
-        -Destination (Join-Path $ServerPackageRoot "ServerRepository")
+        -Destination (
+            Join-Path $ServerPackageRoot "ServerRepository\Scripts"
+        )
 }
 
 # The repository setup uses the same Login creation implementation with the
 # RepositoryWriter permission profile.
 Copy-Item `
     -LiteralPath (Join-Path $AgentSource "New-SqlServiceLogin.ps1") `
-    -Destination (Join-Path $ServerPackageRoot "ServerRepository")
+    -Destination (Join-Path $ServerPackageRoot "ServerRepository\Scripts")
 Copy-Item `
     -Path (Join-Path $GetDBInfoSource "*.ps1") `
     -Destination (Join-Path $ServerPackageRoot "GetDBInfo")

@@ -162,6 +162,19 @@ function Get-SqlAgentConfig {
         throw "Agent configuration file not found: $LiteralPath"
     }
 
+    $AllowedKeys = @(
+        "SqlLoginName",
+        "RepositoryInstance",
+        "RepositoryDatabase",
+        "RepositorySchema",
+        "RepositoryTable"
+    )
+    $RepositoryKeys = @(
+        "RepositoryInstance",
+        "RepositoryDatabase",
+        "RepositorySchema",
+        "RepositoryTable"
+    )
     $FileValues = @{}
     $LineNumber = 0
 
@@ -192,7 +205,7 @@ function Get-SqlAgentConfig {
         $Key = $TrimmedLine.Substring(0, $SeparatorIndex).Trim()
         $Value = $TrimmedLine.Substring($SeparatorIndex + 1).Trim()
 
-        if ($Key -ne "SqlLoginName") {
+        if ($AllowedKeys -notcontains $Key) {
             throw (
                 "Unknown agent configuration key [$Key] at " +
                 "[$LiteralPath] line $LineNumber."
@@ -230,8 +243,65 @@ function Get-SqlAgentConfig {
         )
     }
 
+    $ConfiguredRepositoryKeys = @(
+        $RepositoryKeys |
+            Where-Object { $FileValues.ContainsKey($_) }
+    )
+
+    if (
+        $ConfiguredRepositoryKeys.Count -gt 0 -and
+        $ConfiguredRepositoryKeys.Count -ne $RepositoryKeys.Count
+    ) {
+        $MissingRepositoryKeys = @(
+            $RepositoryKeys |
+                Where-Object { -not $FileValues.ContainsKey($_) }
+        )
+        throw (
+            "Incomplete repository settings in agent configuration " +
+            "[$LiteralPath]. Missing: " +
+            ($MissingRepositoryKeys -join ", ")
+        )
+    }
+
+    foreach ($SqlIdentifierKey in @(
+        "RepositoryDatabase",
+        "RepositorySchema",
+        "RepositoryTable"
+    )) {
+        if (
+            $FileValues.ContainsKey($SqlIdentifierKey) -and
+            $FileValues[$SqlIdentifierKey] `
+                -notmatch '^[A-Za-z_][A-Za-z0-9_@$#]*$'
+        ) {
+            throw (
+                "Invalid SQL identifier " +
+                "[$($FileValues[$SqlIdentifierKey])] for agent " +
+                "configuration key [$SqlIdentifierKey] in [$LiteralPath]."
+            )
+        }
+    }
+
+    $HasRepositoryConfiguration =
+        $ConfiguredRepositoryKeys.Count -eq $RepositoryKeys.Count
+    $RepositoryInstance = $null
+    $RepositoryDatabase = $null
+    $RepositorySchema = $null
+    $RepositoryTable = $null
+
+    if ($HasRepositoryConfiguration) {
+        $RepositoryInstance = [string]$FileValues.RepositoryInstance
+        $RepositoryDatabase = [string]$FileValues.RepositoryDatabase
+        $RepositorySchema = [string]$FileValues.RepositorySchema
+        $RepositoryTable = [string]$FileValues.RepositoryTable
+    }
+
     [pscustomobject]@{
-        SqlLoginName = [string]$FileValues.SqlLoginName
+        SqlLoginName               = [string]$FileValues.SqlLoginName
+        RepositoryInstance         = $RepositoryInstance
+        RepositoryDatabase         = $RepositoryDatabase
+        RepositorySchema           = $RepositorySchema
+        RepositoryTable            = $RepositoryTable
+        HasRepositoryConfiguration = $HasRepositoryConfiguration
     }
 }
 
@@ -915,6 +985,13 @@ SELECT
         HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'CONTROL'),
         0
     ) AS [HasControlDatabase],
+    CASE
+        WHEN COL_LENGTH(
+            @QualifiedTable,
+            N'ReportedInstanceName'
+        ) IS NULL THEN 0
+        ELSE 1
+    END AS [HasReportedInstanceName],
     (
         SELECT COUNT_BIG(*)
         FROM sys.database_role_members AS role_membership
@@ -965,6 +1042,10 @@ WHERE [object_id] = @ObjectId
                                     [int]$Reader["IsDbOwner"] -eq 1
                                 HasControlDatabase =
                                     [int]$Reader["HasControlDatabase"] -eq 1
+                                HasReportedInstanceName =
+                                    [int]$Reader[
+                                        "HasReportedInstanceName"
+                                    ] -eq 1
                                 DatabaseRoleCount =
                                     [long]$Reader["DatabaseRoleCount"]
                                 IsSysAdmin =
@@ -1003,6 +1084,14 @@ WHERE [object_id] = @ObjectId
             throw (
                 "Repository column InsName must hold at least 256 " +
                 "characters; found $($ObjectResult.CharacterLength)."
+            )
+        }
+
+        if ($ObjectResult.HasReportedInstanceName) {
+            throw (
+                "Repository table $RepositoryDatabase.$QualifiedTable " +
+                "contains the obsolete ReportedInstanceName column. Run " +
+                "the InitializeRepository action before registration."
             )
         }
 

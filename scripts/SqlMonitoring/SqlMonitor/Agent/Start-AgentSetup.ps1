@@ -5,11 +5,12 @@ Runs SQL monitoring setup tasks assigned to an Agent host.
 .DESCRIPTION
 Uses a supplied in-memory service credential, or prompts once when it is not
 supplied, to provision the monitoring Login on selected Client SQL Server
-instances. This script does not connect to ServerRepository and does not read or
-create repository credential files.
+instances and register them in the central Repository. This script does not
+read or create repository credential files.
 
 .PARAMETER Action
-Agent action to run. Menu displays the interactive menu. The default is Menu.
+Agent action to run. RunAll provisions the Login and then registers the selected
+instances. Menu displays the interactive menu. The default is Menu.
 
 .PARAMETER SourceInstance
 Optional SQL Server connection targets. Supplying this parameter bypasses local
@@ -27,27 +28,28 @@ Optional fallback SQL administrator credential used when Windows authentication
 cannot provision the service Login.
 
 .EXAMPLE
-.\Start-AgentSetup.ps1 -Action RunAll
+.\Start-AgentSetup.ps1 -Action ProvisionLogin
 
 Prompts once for the monitoring credential and provisions selected instances.
 
 .EXAMPLE
 $ServiceCredential = Get-Credential -UserName "dbmonitor"
 .\Start-AgentSetup.ps1 `
-    -Action ProvisionLogin `
+    -Action RunAll `
     -SourceInstance "localhost","localhost\LAB2" `
     -ServiceCredential $ServiceCredential
 
-Provisions the supplied SQL Server instances without local discovery.
+Provisions and registers the supplied SQL Server instances without local
+discovery.
 
 .NOTES
-Repository configuration, registration, key files, and credential XML files
-belong only on ServerRepository.
+Repository connection settings are read from agent.config. Repository key files
+and credential XML files belong only on ServerRepository.
 #>
 [CmdletBinding()]
 param(
     [Parameter()]
-    [ValidateSet("Menu", "ProvisionLogin", "RunAll")]
+    [ValidateSet("Menu", "ProvisionLogin", "RegisterClient", "RunAll")]
     [string]$Action = "Menu",
 
     [Parameter()]
@@ -107,11 +109,39 @@ $CommonModulePath = if (
 else {
     $SourceModulePath
 }
-$ProvisionLoginScript = Join-Path $PSScriptRoot "New-SqlServiceLogin.ps1"
+$PackagedProvisionLoginScript = Join-Path `
+    $PSScriptRoot `
+    "Scripts\New-SqlServiceLogin.ps1"
+$SourceProvisionLoginScript = Join-Path `
+    $PSScriptRoot `
+    "New-SqlServiceLogin.ps1"
+$ProvisionLoginScript = if (
+    Test-Path -LiteralPath $PackagedProvisionLoginScript -PathType Leaf
+) {
+    $PackagedProvisionLoginScript
+}
+else {
+    $SourceProvisionLoginScript
+}
+$PackagedRegisterClientScript = Join-Path `
+    $PSScriptRoot `
+    "Scripts\Register-SqlMonitoringClient.ps1"
+$SourceRegisterClientScript = Join-Path `
+    (Split-Path -Parent $PSScriptRoot) `
+    "ServerRepository\Register-SqlMonitoringClient.ps1"
+$RegisterClientScript = if (
+    Test-Path -LiteralPath $PackagedRegisterClientScript -PathType Leaf
+) {
+    $PackagedRegisterClientScript
+}
+else {
+    $SourceRegisterClientScript
+}
 
 foreach ($RequiredPath in @(
     $CommonModulePath,
-    $ProvisionLoginScript
+    $ProvisionLoginScript,
+    $RegisterClientScript
 )) {
     if (-not (Test-Path -LiteralPath $RequiredPath -PathType Leaf)) {
         throw "Required file not found: $RequiredPath"
@@ -120,8 +150,9 @@ foreach ($RequiredPath in @(
 
 Import-Module $CommonModulePath -Force
 
+$AgentConfig = Get-SqlAgentConfig -LiteralPath $ConfigPath
+
 if (-not $PSBoundParameters.ContainsKey("SqlLoginName")) {
-    $AgentConfig = Get-SqlAgentConfig -LiteralPath $ConfigPath
     $SqlLoginName = $AgentConfig.SqlLoginName
 }
 
@@ -213,13 +244,58 @@ function Invoke-AgentProvisionLogin {
     [void](& $ProvisionLoginScript @Parameters)
 }
 
+function Invoke-AgentRegisterClient {
+    [CmdletBinding()]
+    param()
+
+    $SelectedInstances = @(Get-AgentSqlInstanceSelection)
+    $Credential = Get-AgentServiceCredential
+
+    Write-Host (
+        "Repository instance: $($AgentConfig.RepositoryInstance)"
+    )
+    Write-Host (
+        "Repository database: $($AgentConfig.RepositoryDatabase)"
+    )
+    Write-Host (
+        "Repository table: " +
+        "[$($AgentConfig.RepositorySchema)]." +
+        "[$($AgentConfig.RepositoryTable)]"
+    )
+
+    $Parameters = @{
+        SourceInstance           = $SelectedInstances.ConnectionTarget
+        ConfigPath               = $ConfigPath
+        SqlLoginName             = $SqlLoginName
+        Credential               = $Credential
+        ConnectionTimeoutSeconds = $ConnectionTimeoutSeconds
+        CommandTimeoutSeconds    = $CommandTimeoutSeconds
+        RetryCount               = $RetryCount
+        RetryDelaySeconds        = $RetryDelaySeconds
+        LogDirectory             = $LogDirectory
+    }
+
+    [void](& $RegisterClientScript @Parameters)
+}
+
 function Invoke-AgentAction {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet("ProvisionLogin", "RunAll")]
+        [ValidateSet("ProvisionLogin", "RegisterClient", "RunAll")]
         [string]$SelectedAction
     )
+
+    if (
+        @("RegisterClient", "RunAll") -contains $SelectedAction -and
+        -not $AgentConfig.HasRepositoryConfiguration
+    ) {
+        throw (
+            "RegisterClient requires RepositoryInstance, " +
+            "RepositoryDatabase, RepositorySchema, and RepositoryTable " +
+            "in agent configuration [$ConfigPath]."
+        )
+    }
 
     Write-SqlMaintenanceLog `
         -LogContext $LogContext `
@@ -231,8 +307,12 @@ function Invoke-AgentAction {
         "ProvisionLogin" {
             Invoke-AgentProvisionLogin
         }
+        "RegisterClient" {
+            Invoke-AgentRegisterClient
+        }
         "RunAll" {
             Invoke-AgentProvisionLogin
+            Invoke-AgentRegisterClient
         }
     }
 
@@ -256,7 +336,8 @@ while ($true) {
     Write-Host "SQL Monitoring Agent Setup"
     Write-Host "=========================="
     Write-Host "1. Provision service Login on selected instances"
-    Write-Host "2. Run all Client Agent setup steps"
+    Write-Host "2. Register selected instances in Repository"
+    Write-Host "3. Run all Agent setup actions"
     Write-Host "Q. Exit"
     Write-Host ""
 
@@ -268,7 +349,8 @@ while ($true) {
 
     $SelectedAction = switch ($MenuSelection) {
         "1" { "ProvisionLogin" }
-        "2" { "RunAll" }
+        "2" { "RegisterClient" }
+        "3" { "RunAll" }
         default { $null }
     }
 

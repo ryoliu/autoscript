@@ -85,9 +85,7 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$ConfigPath = (
-        Join-Path $PSScriptRoot "Config\agent.config"
-    ),
+    [string]$ConfigPath,
 
     [Parameter()]
     [ValidatePattern('^[A-Za-z0-9._-]+$')]
@@ -121,7 +119,7 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$LogDirectory = (Join-Path $PSScriptRoot "Logs"),
+    [string]$LogDirectory,
 
     [Parameter()]
     [psobject]$LogContext
@@ -130,26 +128,68 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$PackagedModulePath = Join-Path `
-    $PSScriptRoot `
-    "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
-$SourceModulePath = Join-Path `
-    (Split-Path -Parent $PSScriptRoot) `
-    "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
-$CommonModulePath = if (
-    Test-Path -LiteralPath $PackagedModulePath -PathType Leaf
-) {
-    $PackagedModulePath
+$ModuleRootCandidates = @(
+    (Split-Path -Parent $PSScriptRoot),
+    (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
+)
+$CommonModuleRoot = $ModuleRootCandidates |
+    Where-Object {
+        Test-Path `
+            -LiteralPath (
+                Join-Path `
+                    $_ `
+                    "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
+            ) `
+            -PathType Leaf
+    } |
+    Select-Object -First 1
+
+if ([string]::IsNullOrWhiteSpace($CommonModuleRoot)) {
+    throw "Required SqlMaintenance.Common module was not found."
 }
-else {
-    $SourceModulePath
-}
+
+$CommonModulePath = Join-Path `
+    $CommonModuleRoot `
+    "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
 
 if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
     throw "Required module not found: $CommonModulePath"
 }
 
 Import-Module $CommonModulePath -Force
+
+$LocalAgentConfigPath = Join-Path $PSScriptRoot "Config\agent.config"
+$PackagedAgentConfigPath = Join-Path `
+    $CommonModuleRoot `
+    "Config\agent.config"
+$AgentRuntimeRoot = if (
+    Test-Path -LiteralPath $LocalAgentConfigPath -PathType Leaf
+) {
+    $PSScriptRoot
+}
+else {
+    $CommonModuleRoot
+}
+
+if (
+    -not $PSBoundParameters.ContainsKey("ConfigPath") -and
+    -not $PSBoundParameters.ContainsKey("ServiceLoginName")
+) {
+    $ConfigPath = @(
+        $LocalAgentConfigPath,
+        $PackagedAgentConfigPath
+    ) |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
+
+    if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+        throw "Agent configuration file was not found."
+    }
+}
+
+if (-not $PSBoundParameters.ContainsKey("LogDirectory")) {
+    $LogDirectory = Join-Path $AgentRuntimeRoot "Logs"
+}
 
 if (-not $PSBoundParameters.ContainsKey("ServiceLoginName")) {
     $AgentConfig = Get-SqlAgentConfig -LiteralPath $ConfigPath

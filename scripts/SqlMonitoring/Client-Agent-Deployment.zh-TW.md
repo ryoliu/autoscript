@@ -14,31 +14,32 @@ Principal。
 ```text
 Client Agent
     Creates the local monitoring Login
-                    |
-                    v
-ServerRepository
-    Registers SQL connection targets
-    Stores the central credential
-    Runs GetDBInfo collectors
+    Registers its SQL connection target
                     |
                     v
 Repository Database
-    Stores monitoring results
+    Stores registered targets and monitoring results
+                    ^
+                    |
+ServerRepository
+    Stores the central credential
+    Runs GetDBInfo collectors
 ```
 
-Client Agent 只負責建立及驗證 Client 本機監控 Login。Repository 初始化、
-Instance 註冊、Credential 保存、GetDBInfo Collector 與 SQL Agent Job 全部
-留在 ServerRepository。
+Client Agent 負責建立及驗證本機監控 Login，並將 SQL 連線目標登錄到中央
+Repository Instance 清單。Repository 初始化、Credential 保存、GetDBInfo
+Collector 與 SQL Agent Job 留在 ServerRepository。
 
-Client 不保存中央 Repository 使用的 AES key 或 Credential XML，也不直接
-寫入 Repository Database。
+Client 的 `agent.config` 保存 Repository Instance、Database、Schema 與
+Table，但不保存中央 Repository 使用的 AES key、Credential XML 或
+`repository.config`。Credential 只在記憶體中使用。
 
 ## 元件責任
 
 | 元件 | 部署位置 | 責任 |
 | --- | --- | --- |
-| Client Agent | Client | 建立監控 Login、授予唯讀監控權限及驗證連線 |
-| ServerRepository | 中央 Repository 主機 | 初始化 Repository、管理 Instance 清單及 Credential |
+| Client Agent | Client | 建立監控 Login、驗證連線及註冊 Instance |
+| ServerRepository | 中央 Repository 主機 | 初始化 Repository、保存 Credential 及執行集中收集 |
 | GetDBInfo Collector | 中央 Repository 主機 | 連線各 SQL Instance、收集並寫入資料 |
 | SQL Agent Job | Repository SQL Server | 定期執行 GetDBInfo Controller |
 
@@ -49,7 +50,9 @@ Client 不保存中央 Repository 使用的 AES key 或 Credential XML，也不�
 ```text
 C:\SQLSERVER\SqlMonitoringClient\
 |-- Start-AgentSetup.ps1
-|-- New-SqlServiceLogin.ps1
+|-- Scripts\
+|   |-- New-SqlServiceLogin.ps1
+|   `-- Register-SqlMonitoringClient.ps1
 |-- Config\
 |   `-- agent.config
 |-- Modules\
@@ -62,18 +65,22 @@ C:\SQLSERVER\SqlMonitoringClient\
 
 ```ini
 SqlLoginName=dbmonitor
+RepositoryInstance=WIN2019LAB
+RepositoryDatabase=Monitor
+RepositorySchema=dbo
+RepositoryTable=InsList
 ```
 
 ### ServerRepository
 
 ```text
 C:\SQLSERVER\SqlMonitoringServer\
+|-- Start-ServerRepositorySetup.ps1
 |-- ServerRepository\
-|   |-- Start-ServerRepositorySetup.ps1
-|   |-- Initialize-SqlMonitorRepository.ps1
-|   |-- New-SqlCredentialKey.ps1
-|   |-- New-SqlServiceLogin.ps1
-|   `-- Register-SqlMonitoringClient.ps1
+|   `-- Scripts\
+|       |-- Initialize-SqlMonitorRepository.ps1
+|       |-- New-SqlCredentialKey.ps1
+|       `-- New-SqlServiceLogin.ps1
 |-- GetDBInfo\
 |-- Config\
 |   `-- repository.config
@@ -129,7 +136,8 @@ E:\SqlMonitoringServer
 `OutputRoot` 本身可以已經存在，但其下的 `SqlMonitoringClient` 與
 `SqlMonitoringServer` 目錄不可事先存在。腳本遇到其中任一目錄已存在時會
 停止，不會覆寫既有部署包。Client 包不會包含 Repository Config、GetDBInfo、
-中央註冊腳本、AES key 或 Credential XML。
+AES key 或 Credential XML。Client 註冊腳本只接受明確指定的 Repository
+位置及記憶體中的 Credential。
 
 ## 權限設計
 
@@ -240,6 +248,10 @@ C:\SQLSERVER\SqlMonitoringClient
 
 ```ini
 SqlLoginName=dbmonitor
+RepositoryInstance=WIN2019LAB
+RepositoryDatabase=Monitor
+RepositorySchema=dbo
+RepositoryTable=InsList
 ```
 
 使用具備建立 Login 及授權能力的 Windows 帳號執行：
@@ -248,10 +260,18 @@ SqlLoginName=dbmonitor
 $ServiceCredential = Get-Credential -UserName "dbmonitor"
 
 & "C:\SQLSERVER\SqlMonitoringClient\Start-AgentSetup.ps1" `
-    -Action ProvisionLogin `
+    -Action RunAll `
     -SourceInstance "localhost" `
     -ServiceCredential $ServiceCredential
 ```
+
+直接執行 `Start-AgentSetup.ps1` 時，Console 選單提供：
+
+1. 建立或更新選定 Instance 的監控 Login。
+2. 將選定 Instance 註冊到 Repository。
+3. 依序執行上述兩個動作。
+
+`RunAll` 會重複使用同一次 Instance 選擇及 Credential。
 
 具名執行個體：
 
@@ -272,7 +292,7 @@ C:\SQLSERVER\SqlMonitoringServer
 Repository SQL Instance 不監控自己：
 
 ```powershell
-& "C:\SQLSERVER\SqlMonitoringServer\ServerRepository\Start-ServerRepositorySetup.ps1" `
+& "C:\SQLSERVER\SqlMonitoringServer\Start-ServerRepositorySetup.ps1" `
     -Action RunAll `
     -EnableCollectorJob `
     -IncludeTopResourceUsage
@@ -281,7 +301,7 @@ Repository SQL Instance 不監控自己：
 Repository SQL Instance 同時監控自己：
 
 ```powershell
-& "C:\SQLSERVER\SqlMonitoringServer\ServerRepository\Start-ServerRepositorySetup.ps1" `
+& "C:\SQLSERVER\SqlMonitoringServer\Start-ServerRepositorySetup.ps1" `
     -Action RunAll `
     -MonitorRepositoryInstance `
     -EnableCollectorJob `
@@ -329,36 +349,62 @@ System 及本機 Administrators 擁有完整控制權，並預設授予
 
 ### 3. 註冊 Client Instance
 
-在 ServerRepository 執行：
+在 Client 執行。註冊使用的 Credential 必須能連線 Client SQL Instance，
+並具備 Repository Instance 清單的寫入權限：
 
 ```powershell
-& "C:\SQLSERVER\SqlMonitoringServer\ServerRepository\Register-SqlMonitoringClient.ps1" `
-    -SourceInstance "CLIENT01\INSTANCE01" `
-    -RunCollectionTest `
-    -IncludeTopResourceUsage
+$RegistrationCredential = Get-Credential -UserName "dbmonitor"
+
+& "C:\SQLSERVER\SqlMonitoringClient\Scripts\Register-SqlMonitoringClient.ps1" `
+    -Credential $RegistrationCredential
 ```
 
-中央註冊程序會：
+Repository Instance、Database、Schema 與 Table 預設由 `agent.config` 讀取。
+需要暫時覆寫時，仍可明確指定對應的命令列參數。
 
-1. 載入中央保存的 `dbmonitor` Credential。
-2. 測試 Client SQL 連線。
-3. 取得 SQL Server 回報的正式 Instance Name。
-4. 新增或更新 Repository Instance 清單。
-5. 選擇性執行一次限定範圍的收集測試。
+升級既有 Repository 時，先執行一次初始化：
+
+```powershell
+& "C:\SQLSERVER\SqlMonitoringServer\Start-ServerRepositorySetup.ps1" `
+    -Action InitializeRepository
+```
+
+初始化會將既有 `ReportedInstanceName` 搬入 `InsName`，確認不會產生重複
+資料後移除 `ReportedInstanceName`。Instance 清單最後只保留 `InsName`：
+
+```text
+WIN2019LAB\LAB2
+WIN2019LAB
+```
+
+腳本會列出本機 SQL Server Instance。輸入 `A` 會選擇所有狀態為
+`Running` 的 Instance，選擇完成後直接執行註冊。若要略過互動選單，可使用
+`-SourceInstance "localhost\INSTANCE01"` 明確指定連線目標。
+
+Client 註冊程序會：
+
+1. 使用記憶體中的 Credential 測試 Client SQL 連線。
+2. 取得 SQL Server 回報的正式 Instance Name。
+3. 將正式 Instance Name 新增到 Repository 的 `InsName`。
+
+此腳本不會讀取或建立 AES key、Credential XML，也不會從 Client 執行
+GetDBInfo Collection Test。
 
 ### 4. 註冊 Repository Instance
 
 只有 Repository 需要監控自己時才執行：
 
 ```powershell
-& "C:\SQLSERVER\SqlMonitoringServer\ServerRepository\Register-SqlMonitoringClient.ps1" `
+$RegistrationCredential = Get-Credential -UserName "dbmonitor"
+
+& "C:\SQLSERVER\SqlMonitoringClient\Scripts\Register-SqlMonitoringClient.ps1" `
     -SourceInstance "SQLREPOSITORY01" `
-    -RunCollectionTest `
-    -IncludeTopResourceUsage
+    -Credential $RegistrationCredential
 ```
 
 `-MonitorRepositoryInstance` 只負責授權；Repository Instance 仍必須登錄到
-Instance 清單，Collector 才會執行收集。
+Instance 清單，Collector 才會執行收集。Repository 自我監控時，需要在
+Repository 主機部署或保留一份 Client 部署包來執行註冊腳本。
 
 ### 5. 確認集中收集
 
@@ -417,9 +463,11 @@ Config 修改不會自動重新命名既有 Login、User、key 或 Credential XM
 
 ### Client
 
-- [ ] Client 只有 Agent、Config、共用 Module 及 Logs。
-- [ ] `agent.config` 使用 `SqlLoginName=dbmonitor`。
+- [ ] Client 只有 Agent、註冊腳本、Config、共用 Module 及 Logs。
+- [ ] `agent.config` 已設定 Login 與 Repository 連線資訊。
 - [ ] Client 不包含 ServerRepository、GetDBInfo、key 或 Credential XML。
+- [ ] Client 註冊腳本沒有保存 Repository Credential。
+- [ ] Client Instance 已登錄到 Repository Instance 清單。
 - [ ] `dbmonitor` Login 已建立且 Credential 驗證成功。
 - [ ] `dbmonitor` 不具備 `sysadmin` 或 Server Role Membership。
 - [ ] `dbmonitor` 具有 ClientMonitor Server 權限。

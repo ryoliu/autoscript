@@ -3,43 +3,56 @@
 Registers SQL Server Client connection targets in the central repository.
 
 .DESCRIPTION
-Runs only on ServerRepository. The script loads the centrally stored monitoring
-credential, verifies each Client connection, reads the SQL Server reported
-instance name, and inserts or updates the repository instance list. An optional
-scoped collection test runs only against the registered connection targets.
+Runs from a Client Agent deployment package. The script uses an in-memory SQL
+credential to verify each Client connection, reads the SQL Server reported
+instance name, reads the Repository target from agent.config, and inserts or
+updates the central repository instance list.
 
-InsName stores the connection target used by GetDBInfo. ReportedInstanceName
-stores the name returned by SERVERPROPERTY and is not used as a connection
-string.
+The Client package does not store the central AES key, credential XML, or
+GetDBInfo Collector scripts.
+
+InsName stores the SQL Server name returned by SERVERPROPERTY. SourceInstance
+is used only to connect during registration and is not stored in the Repository.
 
 .PARAMETER SourceInstance
-One or more Client SQL Server connection targets, such as CLIENT01,
-CLIENT01\INSTANCE01, or CLIENT01,14330.
+Optional Client SQL Server connection targets, such as CLIENT01,
+CLIENT01\INSTANCE01, or CLIENT01,14330. When omitted, the script displays local
+SQL Server instances and prompts for the instances to register.
+
+.PARAMETER RepositoryInstance
+Optional central SQL monitoring Repository instance that overrides
+RepositoryInstance in agent.config.
+
+.PARAMETER RepositoryDatabase
+Optional central SQL monitoring Repository database that overrides
+RepositoryDatabase in agent.config.
+
+.PARAMETER RepositorySchema
+Optional schema containing the Repository instance list that overrides
+RepositorySchema in agent.config.
+
+.PARAMETER RepositoryTable
+Optional Repository instance list table that overrides RepositoryTable in
+agent.config.
+
+.PARAMETER ConfigPath
+Optional path to agent.config. When omitted, the script locates agent.config
+in the Client Agent package.
 
 .PARAMETER Credential
-Optional monitoring credential. When omitted, the central AES key and encrypted
-credential XML are loaded from the Credentials directory.
-
-.PARAMETER RunCollectionTest
-Runs the central GetDBInfo Collector against only the successfully registered
-connection targets. This option requires the central credential files.
-
-.PARAMETER IncludeTopResourceUsage
-Includes the Top Resource Usage report when RunCollectionTest is selected.
+Optional monitoring SQL credential. When omitted, the script prompts once and
+uses the credential only in memory.
 
 .EXAMPLE
+$Credential = Get-Credential -UserName "dbmonitor"
 .\Register-SqlMonitoringClient.ps1 `
-    -SourceInstance "CLIENT01\INSTANCE01"
+    -Credential $Credential
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)]
-    [ValidateNotNullOrEmpty()]
-    [string[]]$SourceInstance,
-
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$ConfigPath,
+    [string[]]$SourceInstance,
 
     [Parameter()]
     [Alias("Ins")]
@@ -59,25 +72,15 @@ param(
     [string]$RepositoryTable,
 
     [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$ConfigPath,
+
+    [Parameter()]
     [ValidatePattern('^[A-Za-z0-9._-]+$')]
     [string]$SqlLoginName,
 
     [Parameter()]
-    [ValidateNotNullOrEmpty()]
-    [string]$CredentialDirectory,
-
-    [Parameter()]
     [PSCredential]$Credential,
-
-    [Parameter()]
-    [switch]$RunCollectionTest,
-
-    [Parameter()]
-    [switch]$IncludeTopResourceUsage,
-
-    [Parameter()]
-    [ValidateNotNullOrEmpty()]
-    [string]$CollectorScriptPath,
 
     [Parameter()]
     [ValidateRange(1, 300)]
@@ -97,18 +100,34 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$LogDirectory = (
-        Join-Path (Split-Path -Parent $PSScriptRoot) "Logs"
-    )
+    [string]$LogDirectory
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ServerRoot = Split-Path -Parent $PSScriptRoot
-$SourceRoot = Split-Path -Parent $ServerRoot
+$ModuleRootCandidates = @(
+    (Split-Path -Parent $PSScriptRoot),
+    (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
+)
+$PackageRoot = $ModuleRootCandidates |
+    Where-Object {
+        Test-Path `
+            -LiteralPath (
+                Join-Path `
+                    $_ `
+                    "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
+            ) `
+            -PathType Leaf
+    } |
+    Select-Object -First 1
+
+if ([string]::IsNullOrWhiteSpace($PackageRoot)) {
+    throw "Required SqlMaintenance.Common module was not found."
+}
+
 $CommonModulePath = Join-Path `
-    $ServerRoot `
+    $PackageRoot `
     "Modules\SqlMaintenance.Common\SqlMaintenance.Common.psm1"
 
 if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
@@ -117,105 +136,87 @@ if (-not (Test-Path -LiteralPath $CommonModulePath -PathType Leaf)) {
 
 Import-Module $CommonModulePath -Force
 
+if (-not $PSBoundParameters.ContainsKey("LogDirectory")) {
+    $LogDirectory = Join-Path $PackageRoot "Logs"
+}
+
 if (-not $PSBoundParameters.ContainsKey("ConfigPath")) {
-    $ConfigCandidates = @(
-        (Join-Path $ServerRoot "Config\repository.config"),
-        (Join-Path $SourceRoot "Config\repository.config")
+    $ConfigPath = @(
+        (Join-Path $PackageRoot "Config\agent.config"),
+        (Join-Path $PackageRoot "Agent\Config\agent.config")
     )
-    $ConfigPath = $ConfigCandidates |
+    $ConfigPath = $ConfigPath |
         Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
         Select-Object -First 1
-
-    if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-        throw "Repository configuration file was not found."
-    }
 }
 
-$RepositoryConfigParameters = @{ LiteralPath = $ConfigPath }
-
-foreach ($ParameterName in @(
-    "RepositoryInstance",
-    "RepositoryDatabase",
-    "RepositorySchema",
-    "RepositoryTable"
-)) {
-    if ($PSBoundParameters.ContainsKey($ParameterName)) {
-        $RepositoryConfigParameters[$ParameterName] =
-            $PSBoundParameters[$ParameterName]
-    }
+if (
+    [string]::IsNullOrWhiteSpace($ConfigPath) -or
+    -not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)
+) {
+    throw "Agent configuration file was not found: $ConfigPath"
 }
 
-$RepositoryConfig = Get-SqlRepositoryConfig @RepositoryConfigParameters
-$RepositoryInstance = $RepositoryConfig.RepositoryInstance
-$RepositoryDatabase = $RepositoryConfig.RepositoryDatabase
-$RepositorySchema = $RepositoryConfig.RepositorySchema
-$RepositoryTable = $RepositoryConfig.RepositoryTable
+$AgentConfig = Get-SqlAgentConfig -LiteralPath $ConfigPath
 
 if (-not $PSBoundParameters.ContainsKey("SqlLoginName")) {
-    $SqlLoginName = $RepositoryConfig.SqlLoginName
+    $SqlLoginName = $AgentConfig.SqlLoginName
 }
 
-if (-not $PSBoundParameters.ContainsKey("CredentialDirectory")) {
-    $CredentialCandidates = @(
-        (Join-Path $ServerRoot "Credentials"),
-        (Join-Path $SourceRoot "Credentials")
-    )
-    $CredentialDirectory = $CredentialCandidates |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Container } |
-        Select-Object -First 1
+if (-not $PSBoundParameters.ContainsKey("RepositoryInstance")) {
+    $RepositoryInstance = $AgentConfig.RepositoryInstance
+}
 
-    if ([string]::IsNullOrWhiteSpace($CredentialDirectory)) {
-        throw "Central credential directory was not found."
+if (-not $PSBoundParameters.ContainsKey("RepositoryDatabase")) {
+    $RepositoryDatabase = $AgentConfig.RepositoryDatabase
+}
+
+if (-not $PSBoundParameters.ContainsKey("RepositorySchema")) {
+    $RepositorySchema = $AgentConfig.RepositorySchema
+}
+
+if (-not $PSBoundParameters.ContainsKey("RepositoryTable")) {
+    $RepositoryTable = $AgentConfig.RepositoryTable
+}
+
+$RequiredRepositorySettings = [ordered]@{
+    RepositoryInstance = $RepositoryInstance
+    RepositoryDatabase = $RepositoryDatabase
+    RepositorySchema   = $RepositorySchema
+    RepositoryTable    = $RepositoryTable
+}
+
+foreach ($RepositorySetting in $RequiredRepositorySettings.GetEnumerator()) {
+    if ([string]::IsNullOrWhiteSpace([string]$RepositorySetting.Value)) {
+        throw (
+            "Repository setting [$($RepositorySetting.Key)] was not " +
+            "provided and is missing from agent configuration [$ConfigPath]."
+        )
     }
 }
 
 $LogContext = New-SqlMaintenanceLogContext `
     -LogDirectory $LogDirectory `
     -OperationName "Register-SqlMonitoringClient"
-$LoadedCredentialPassword = $null
+
+$SelectionParameters = @{}
+
+if ($PSBoundParameters.ContainsKey("SourceInstance")) {
+    $SelectionParameters.SourceInstance = $SourceInstance
+}
+
+$SelectedSourceInstances = @(
+    Select-SqlInstance @SelectionParameters
+)
 
 if ($null -eq $Credential) {
-    $KeyPath = Join-Path $CredentialDirectory "$SqlLoginName.key"
-    $CredentialPath =
-        Join-Path $CredentialDirectory "$SqlLoginName.credential.xml"
+    $Credential = Get-Credential `
+        -UserName $SqlLoginName `
+        -Message "Enter the monitoring SQL credential"
+}
 
-    if (-not (Test-Path -LiteralPath $KeyPath -PathType Leaf)) {
-        throw "SQL credential key not found: $KeyPath"
-    }
-
-    if (-not (Test-Path -LiteralPath $CredentialPath -PathType Leaf)) {
-        throw "Encrypted SQL credential not found: $CredentialPath"
-    }
-
-    $AesKey = [System.IO.File]::ReadAllBytes($KeyPath)
-
-    try {
-        if ($AesKey.Length -notin 16, 24, 32) {
-            throw "Invalid AES key length in [$KeyPath]."
-        }
-
-        $StoredCredential = Import-Clixml -LiteralPath $CredentialPath
-
-        if (
-            $StoredCredential.PSObject.Properties.Name `
-                -notcontains "UserName" -or
-            $StoredCredential.PSObject.Properties.Name `
-                -notcontains "EncryptedPassword"
-        ) {
-            throw "Invalid SQL credential file: $CredentialPath"
-        }
-
-        $LoadedCredentialPassword = ConvertTo-SecureString `
-            -String $StoredCredential.EncryptedPassword `
-            -Key $AesKey
-        $Credential = [PSCredential]::new(
-            [string]$StoredCredential.UserName,
-            $LoadedCredentialPassword
-        )
-    }
-    finally {
-        [System.Array]::Clear($AesKey, 0, $AesKey.Length)
-    }
+if ($null -eq $Credential) {
+    throw "A monitoring SQL credential is required."
 }
 
 if ($Credential.UserName -cne $SqlLoginName) {
@@ -225,9 +226,6 @@ if ($Credential.UserName -cne $SqlLoginName) {
     )
 }
 
-$SelectedSourceInstances = @(
-    Select-SqlInstance -SourceInstance $SourceInstance
-)
 $RepositoryPreflight = Test-SqlMonitorRepository `
     -RepositoryInstance $RepositoryInstance `
     -RepositoryDatabase $RepositoryDatabase `
@@ -239,7 +237,7 @@ $RepositoryPreflight = Test-SqlMonitorRepository `
     -RetryCount $RetryCount `
     -RetryDelaySeconds $RetryDelaySeconds `
     -LogContext $LogContext
-$MaximumConnectionTargetLength = if (
+$MaximumInsNameLength = if (
     $RepositoryPreflight.InsNameLength -eq -1
 ) {
     256
@@ -260,18 +258,10 @@ $RegistrationResults = @()
 try {
     foreach ($SelectedSourceInstance in $SelectedSourceInstances) {
         $ConnectionTarget = $SelectedSourceInstance.ConnectionTarget
-        $ReportedInstanceName = $null
+        $CanonicalInstanceName = $null
 
         try {
-            if ($ConnectionTarget.Length -gt $MaximumConnectionTargetLength) {
-                throw (
-                    "Connection target length $($ConnectionTarget.Length) " +
-                    "exceeds repository InsName length " +
-                    "${MaximumConnectionTargetLength}: $ConnectionTarget"
-                )
-            }
-
-            $ReportedInstanceName = Invoke-SqlWithRetry `
+            $CanonicalInstanceName = Invoke-SqlWithRetry `
                 -Step "ReadInstanceName" `
                 -Instance $ConnectionTarget `
                 -RetryCount $RetryCount `
@@ -306,8 +296,19 @@ SELECT CONVERT(nvarchar(128), SERVERPROPERTY(N'ServerName'));
                     }
                 }
 
-            if ([string]::IsNullOrWhiteSpace($ReportedInstanceName)) {
+            if ([string]::IsNullOrWhiteSpace($CanonicalInstanceName)) {
                 throw "SQL Server returned an empty instance name."
+            }
+
+            $CanonicalInstanceName = $CanonicalInstanceName.Trim()
+
+            if ($CanonicalInstanceName.Length -gt $MaximumInsNameLength) {
+                throw (
+                    "SQL Server instance name length " +
+                    "$($CanonicalInstanceName.Length) exceeds repository " +
+                    "InsName length ${MaximumInsNameLength}: " +
+                    $CanonicalInstanceName
+                )
             }
 
             $RegistrationStatus = Invoke-SqlWithRetry `
@@ -334,9 +335,6 @@ SELECT CONVERT(nvarchar(128), SERVERPROPERTY(N'ServerName'));
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
 
-IF COL_LENGTH(N'$RepositorySchema.$RepositoryTable', N'ReportedInstanceName') IS NULL
-    THROW 50001, 'ReportedInstanceName column is missing.', 1;
-
 DECLARE @RegistrationStatus nvarchar(20);
 
 BEGIN TRANSACTION;
@@ -345,26 +343,20 @@ IF EXISTS
 (
     SELECT 1
     FROM $QualifiedTable WITH (UPDLOCK, HOLDLOCK)
-    WHERE [InsName] = @ConnectionTarget
+    WHERE [InsName] = @InsName
 )
 BEGIN
-    UPDATE $QualifiedTable
-    SET [ReportedInstanceName] = @ReportedInstanceName
-    WHERE [InsName] = @ConnectionTarget;
-
-    SET @RegistrationStatus = N'Updated';
+    SET @RegistrationStatus = N'AlreadyExists';
 END
 ELSE
 BEGIN
     INSERT INTO $QualifiedTable
     (
-        [InsName],
-        [ReportedInstanceName]
+        [InsName]
     )
     VALUES
     (
-        @ConnectionTarget,
-        @ReportedInstanceName
+        @InsName
     );
 
     SET @RegistrationStatus = N'Inserted';
@@ -375,19 +367,12 @@ COMMIT TRANSACTION;
 SELECT @RegistrationStatus;
 "@
                             [void]$Command.Parameters.Add(
-                                "@ConnectionTarget",
+                                "@InsName",
                                 [System.Data.SqlDbType]::NVarChar,
                                 256
                             )
-                            [void]$Command.Parameters.Add(
-                                "@ReportedInstanceName",
-                                [System.Data.SqlDbType]::NVarChar,
-                                128
-                            )
-                            $Command.Parameters["@ConnectionTarget"].Value =
-                                $ConnectionTarget
-                            $Command.Parameters["@ReportedInstanceName"].Value =
-                                $ReportedInstanceName
+                            $Command.Parameters["@InsName"].Value =
+                                $CanonicalInstanceName
                             [string]$Command.ExecuteScalar()
                         }
                         finally {
@@ -404,13 +389,13 @@ SELECT @RegistrationStatus;
                 -Level Info `
                 -Step "RegisterClient" `
                 -Instance $ConnectionTarget `
-                -Message "${ReportedInstanceName}: $RegistrationStatus"
+                -Message "${CanonicalInstanceName}: $RegistrationStatus"
 
             $RegistrationResults += [pscustomobject]@{
-                ConnectionTarget     = $ConnectionTarget
-                ReportedInstanceName = $ReportedInstanceName
-                Status               = $RegistrationStatus
-                Detail               = "Success"
+                ConnectionTarget = $ConnectionTarget
+                InsName          = $CanonicalInstanceName
+                Status           = $RegistrationStatus
+                Detail           = "Success"
             }
         }
         catch {
@@ -422,20 +407,16 @@ SELECT @RegistrationStatus;
                 -Message $_.Exception.Message
 
             $RegistrationResults += [pscustomobject]@{
-                ConnectionTarget     = $ConnectionTarget
-                ReportedInstanceName = $ReportedInstanceName
-                Status               = "Failed"
-                Detail               = $_.Exception.Message
+                ConnectionTarget = $ConnectionTarget
+                InsName          = $CanonicalInstanceName
+                Status           = "Failed"
+                Detail           = $_.Exception.Message
             }
         }
     }
 }
 finally {
     $ReadOnlyPassword.Dispose()
-
-    if ($null -ne $LoadedCredentialPassword) {
-        $LoadedCredentialPassword.Dispose()
-    }
 }
 
 $FailedResults = @(
@@ -444,61 +425,6 @@ $FailedResults = @(
 
 if ($FailedResults.Count -gt 0) {
     throw "One or more SQL Server Clients failed to register."
-}
-
-if ($RunCollectionTest) {
-    if (-not $PSBoundParameters.ContainsKey("CollectorScriptPath")) {
-        $CollectorScriptPath = @(
-            (Join-Path $ServerRoot "GetDBInfo\_Get-DBInfo-Simple.ps1"),
-            (Join-Path $SourceRoot "GetDBInfo\_Get-DBInfo-Simple.ps1")
-        ) |
-            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
-            Select-Object -First 1
-    }
-
-    if (
-        [string]::IsNullOrWhiteSpace($CollectorScriptPath) -or
-        -not (Test-Path -LiteralPath $CollectorScriptPath -PathType Leaf)
-    ) {
-        throw "GetDBInfo Collector script was not found."
-    }
-
-    $CollectionTestParameters = @{
-        SourceInstance = @(
-            $RegistrationResults | ForEach-Object ConnectionTarget
-        )
-    }
-
-    if ($IncludeTopResourceUsage) {
-        $CollectionTestParameters.IncludeTopResourceUsage = $true
-    }
-
-    Write-SqlMaintenanceLog `
-        -LogContext $LogContext `
-        -Level Info `
-        -Step "CollectionTest" `
-        -Instance $RepositoryInstance `
-        -Message "Starting scoped GetDBInfo collection test."
-
-    try {
-        & $CollectorScriptPath @CollectionTestParameters
-
-        Write-SqlMaintenanceLog `
-            -LogContext $LogContext `
-            -Level Info `
-            -Step "CollectionTest" `
-            -Instance $RepositoryInstance `
-            -Message "Scoped GetDBInfo collection test completed."
-    }
-    catch {
-        Write-SqlMaintenanceLog `
-            -LogContext $LogContext `
-            -Level Error `
-            -Step "CollectionTest" `
-            -Instance $RepositoryInstance `
-            -Message $_.Exception.Message
-        throw
-    }
 }
 
 $RegistrationResults

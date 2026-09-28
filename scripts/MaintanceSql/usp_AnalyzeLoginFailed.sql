@@ -1,3 +1,19 @@
+USE [MS_PERF_COLLECTION]
+GO
+IF  EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[LoginFailed]') AND type in (N'U'))
+DROP TABLE [dbo].[LoginFailed]
+GO
+CREATE TABLE LoginFailed
+(
+    LogDate         DATETIME,
+    LoginName       NVARCHAR(256),
+    FailureType     VARCHAR(50),
+    Reason          NVARCHAR(2000),
+    ClientIP        VARCHAR(48),
+    ProcessInfo     NVARCHAR(50),
+    ErrorText       NVARCHAR(MAX)
+);
+GO
 CREATE OR ALTER PROCEDURE dbo.usp_AnalyzeLoginFailed
 (
     @StartTime      DATETIME = NULL,
@@ -277,20 +293,53 @@ BEGIN
     ----------------------------------------------------------------
     -- 4. Login Failure Details
     ----------------------------------------------------------------
-    SELECT
-        LogDate,
-        LoginName,
-        FailureType,
-        Reason,
-        ClientIP,
-        ErrorText
-    FROM #LoginFailed
-    WHERE
-        (@LoginName IS NULL OR LoginName = @LoginName)
-        AND
-        (@ClientIP IS NULL OR ClientIP = @ClientIP)
-    ORDER BY
-        LogDate;
+    SET XACT_ABORT ON;
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        DELETE FROM dbo.LoginFailed
+        WHERE LogDate >= @StartTime
+          AND LogDate < @EndTime;
+
+        INSERT INTO dbo.LoginFailed
+        (
+            LogDate,
+            LoginName,
+            FailureType,
+            Reason,
+            ClientIP,
+            ProcessInfo,
+            ErrorText
+        )
+        SELECT
+            LogDate,
+            LoginName,
+            FailureType,
+            Reason,
+            ClientIP,
+            ProcessInfo,
+            ErrorText
+        FROM #LoginFailed
+        WHERE LogDate >= @StartTime
+          AND LogDate < @EndTime;
+
+        DELETE FROM dbo.LoginFailed
+        WHERE LogDate < DATEADD
+        (
+            DAY,
+            -30,
+            CONVERT(DATE, GETDATE())
+        );
+
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0
+            ROLLBACK TRANSACTION;
+
+        THROW;
+    END CATCH;
 
 
     ----------------------------------------------------------------

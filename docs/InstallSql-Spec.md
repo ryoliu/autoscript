@@ -49,6 +49,8 @@ InstallSql
 
 CMD 使用 Windows PowerShell 的 `-NoProfile -STA -ExecutionPolicy Bypass` 啟動同目錄的 PS1；不修改系統執行原則。找不到腳本或程序回傳非零結束碼時，會顯示錯誤並等待按鍵，再回傳失敗結束碼。UI 的功能按鈕維持原有的管理員權限提升流程。
 
+由 UI 功能按鈕開啟的 PowerShell 視窗，會在腳本結束碼為 `0` 時自動關閉；非零時顯示結束碼並保留視窗，按 Enter 後才關閉。主 GUI 持續開啟，原始結束碼會保留。
+
 UI 分成四個參數區與一個流程區：
 
 - `Target SQL Instance`

@@ -73,8 +73,7 @@ function New-ScriptCommand {
 
     $parts += ($scriptCommandParts -join ' ')
     $parts += '$autoScriptExitCode = $LASTEXITCODE'
-    $parts += 'Write-Host '''''
-    $parts += 'Read-Host ''Press Enter to close'''
+    $parts += 'if ($autoScriptExitCode -ne 0) { Write-Host "Script failed with exit code $autoScriptExitCode." -ForegroundColor Red; Read-Host ''Press Enter to close'' | Out-Null }'
     $parts += 'exit $autoScriptExitCode'
 
     return ($parts -join '; ')

@@ -41,6 +41,7 @@ autoscript/
     |   |-- Get-VirtualBoxCloneReport.ps1
     |   `-- guestConfig.ps1
     |-- InstallSql/
+    |   |-- Start-AutoScriptUi.cmd
     |   |-- Start-AutoScriptUi.ps1
     |   |-- Start-RemoteSqlInstallTask.ps1
     |   |-- Test-AutoScriptInstallSqlPackage.ps1
@@ -81,11 +82,13 @@ autoscript/
 
 ### SQL Server 安裝與設定
 
-啟動安裝介面：
+雙擊 `scripts/InstallSql/Start-AutoScriptUi.cmd` 啟動安裝介面，或從 PowerShell 執行：
 
 ```powershell
-powershell.exe -NoProfile -File .\scripts\InstallSql\Start-AutoScriptUi.ps1
+.\scripts\InstallSql\Start-AutoScriptUi.cmd
 ```
+
+CMD 啟動檔使用同目錄的 PS1，啟動失敗時會保留錯誤訊息並等待按鍵。開啟 UI 不需提升權限，各功能按鈕會在執行時要求管理員權限。
 
 先確認目標 Instance、SQL ISO、SSMS 與 Hotfix 路徑，再依 `Setup Workflow` 順序操作：
 

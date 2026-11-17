@@ -12,6 +12,7 @@
 
 ```text
 InstallSql
+├─ Start-AutoScriptUi.cmd
 ├─ Start-AutoScriptUi.ps1
 ├─ Invoke-InstallSqlRemote.ps1
 ├─ RemoteInstallSql-Computers.sample.csv
@@ -31,6 +32,7 @@ InstallSql
 規則：
 
 - `Start-AutoScriptUi.ps1` 固定放在 `InstallSql` 根目錄。
+- `Start-AutoScriptUi.cmd` 與 UI 腳本放在同一目錄，供雙擊啟動。
 - `Invoke-InstallSqlRemote.ps1` 固定放在 `InstallSql` 根目錄，用於多台主機遠端部署。
 - `RemoteInstallSql-Computers.sample.csv` 固定放在 `InstallSql` 根目錄，作為遠端部署主機清單範例。
 - 所有實際執行的功能腳本固定放在 `InstallSql\psmodules`。
@@ -39,11 +41,13 @@ InstallSql
 
 ## 3. UI 規格
 
-啟動檔案：
+雙擊 `Start-AutoScriptUi.cmd`，或執行：
 
 ```powershell
-.\Start-AutoScriptUi.ps1
+.\Start-AutoScriptUi.cmd
 ```
+
+CMD 使用 Windows PowerShell 的 `-NoProfile -STA -ExecutionPolicy Bypass` 啟動同目錄的 PS1；不修改系統執行原則。找不到腳本或程序回傳非零結束碼時，會顯示錯誤並等待按鍵，再回傳失敗結束碼。UI 的功能按鈕維持原有的管理員權限提升流程。
 
 UI 分成四個參數區與一個流程區：
 
